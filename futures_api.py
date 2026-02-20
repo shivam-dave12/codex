@@ -126,6 +126,13 @@ class FuturesAPI:
                     error_response['response'] = e.response.json()
                 except:
                     error_response['response'] = e.response.text
+
+            if error_response.get("status_code") == 429:
+                try:
+                    from order_manager import GlobalRateLimiter
+                    GlobalRateLimiter.notify_429()
+                except Exception:
+                    pass
             
             logger.error(f"API request failed: {error_response}")
             return error_response
