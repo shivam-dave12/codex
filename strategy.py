@@ -96,7 +96,8 @@ DR_TP1_ZONE_PCT           = 0.50   # equilibrium of current DR
 DR_TP2_ZONE_PCT           = 0.79   # OTE edge of opposing DR
 
 # Neutral HTF handling (micro-bias execution profile)
-MICRO_BIAS_MSS_WINDOW_MS  = 45 * 60_000
+MICRO_BIAS_5M_WINDOW_MS   = 45 * 60_000
+MICRO_BIAS_15M_WINDOW_MS  = 180 * 60_000
 MICRO_BIAS_MSS_MAX_WEIGHT = 0.35
 MICRO_BIAS_DAILY_WEIGHT   = 0.45
 MICRO_BIAS_CVD_WEIGHT     = 0.20
@@ -652,6 +653,7 @@ class AdvancedICTStrategy:
         self._last_entry_eval_ms         = 0
         self._last_gate_reject_key: Optional[str] = None
         self._last_gate_reject_ms:  int = 0
+        self._last_regime_bos_ts:   int = 0
         self._last_sl_hit_time           = 0
         self._placement_locked_until     = 0
         self.last_sl_update              = 0
@@ -914,9 +916,13 @@ class AdvancedICTStrategy:
                  if ms.structure_type == "BOS"
                  and (current_time - ms.timestamp) < 300_000),
                 None)
+            bos_dir_for_regime = None
+            if recent_bos and recent_bos.timestamp != self._last_regime_bos_ts:
+                bos_dir_for_regime = recent_bos.direction
+                self._last_regime_bos_ts = recent_bos.timestamp
             self.regime_engine.update(
                 c5m, c1h, current_price, current_time,
-                recent_bos.direction if recent_bos else None)
+                bos_dir_for_regime)
 
             # ── Volume / liquidity model ──────────────────────────────────────
             if self.volume_analyzer and c5m:
@@ -1076,27 +1082,40 @@ class AdvancedICTStrategy:
             components["daily"] = -MICRO_BIAS_DAILY_WEIGHT
             daily_dir = "BEARISH"
 
+        # 2) Firm STF structure confirmation with anti-stall policy:
+        #    Prefer 5m+15m agreement; if 15m not available, allow strong 5m with extra support.
         # 2) Firm STF structure confirmation: latest 5m and 15m BOS/CHoCH must agree
         last_5m = next(
             (ms for ms in reversed(list(self.market_structures))
              if ms.timeframe == "5m"
              and ms.structure_type in ("BOS", "CHoCH")
-             and (current_time - ms.timestamp) <= MICRO_BIAS_MSS_WINDOW_MS),
+             and (current_time - ms.timestamp) <= MICRO_BIAS_5M_WINDOW_MS),
             None,
         )
         last_15m = next(
             (ms for ms in reversed(list(self.market_structures))
              if ms.timeframe == "15m"
              and ms.structure_type in ("BOS", "CHoCH")
-             and (current_time - ms.timestamp) <= (MICRO_BIAS_MSS_WINDOW_MS * 2)),
+             and (current_time - ms.timestamp) <= MICRO_BIAS_15M_WINDOW_MS),
             None,
         )
 
-        if not last_5m or not last_15m or last_5m.direction != last_15m.direction:
+        if not last_5m and not last_15m:
             return "NEUTRAL", 0.0, components
 
-        structural_dir = "BULLISH" if last_5m.direction == "bullish" else "BEARISH"
-        structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT
+        strict_agreement = (last_5m is not None and last_15m is not None)
+        if strict_agreement and last_5m.direction != last_15m.direction:
+            return "NEUTRAL", 0.0, components
+
+        if strict_agreement:
+            structural_dir = "BULLISH" if last_5m.direction == "bullish" else "BEARISH"
+            structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT
+        else:
+            # Only one structure source available -> reduced structural confidence.
+            anchor = last_5m or last_15m
+            structural_dir = "BULLISH" if anchor.direction == "bullish" else "BEARISH"
+            structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT * 0.65
+
         if structural_dir == "BULLISH":
             bull += structural_weight
             components["mss"] = structural_weight
@@ -1123,13 +1142,17 @@ class AdvancedICTStrategy:
         edge = abs(bull - bear)
         strength = min(max(max(bull, bear), 0.0), 1.0)
 
-        # Firmness gate: structure must be supported by at least one additional signal.
+        # Firmness gate: when 5m+15m agree -> require 1 supporter;
+        # when only one timeframe structure is available -> require 2 supporters.
         supporters = 0
         if daily_dir == structural_dir:
             supporters += 1
         if cvd_dir == structural_dir:
             supporters += 1
-        if supporters < 1 or edge < MICRO_BIAS_MIN_EDGE:
+
+        min_supporters = 1 if strict_agreement else 2
+        min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
+        if supporters < min_supporters or edge < min_edge:
             return "NEUTRAL", strength, components
 
         return structural_dir, strength, components
