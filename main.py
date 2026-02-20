@@ -272,6 +272,9 @@ class ICTBot:
                 f"TCE={stats.get('tce_state', 'N/A')} "
                 f"prob={stats.get('tce_pullback_prob', 0):.0%}"
             )
+            state_line = (
+                f"RuntimeState={strat.get_runtime_state() if hasattr(strat, 'get_runtime_state') else getattr(strat, 'state', 'N/A')}"
+            )
             tranche_line = (
                 f"Tranche={stats.get('tranche_index', 0)}/3 "
                 f"Trail={'ON' if stats.get('trail_active') else 'OFF'}"
@@ -327,7 +330,7 @@ class ICTBot:
                     lookback_seconds=300),
                 # v9 extra context appended as footer lines
                 extra_lines=list(filter(None, [
-                    regime_line, dr_line, tce_line,
+                    state_line, regime_line, dr_line, tce_line,
                     tranche_line, preserve_line, degraded_line,
                 ])),
             )

@@ -132,6 +132,7 @@ class ICTDataManager:
 
         # Readiness
         self._strategy_ref = None   # set via register_strategy()
+        self._closed_candle_callbacks = []
         self.is_ready: bool = False
         self.is_streaming: bool = False
 
@@ -246,8 +247,28 @@ class ICTDataManager:
         Must be called AFTER both data_manager.start() and strategy.__init__().
         """
         self._strategy_ref = strategy
+        cb = getattr(strategy, "on_closed_candle", None)
+        if callable(cb):
+            self._closed_candle_callbacks.append(cb)
         logger.info("✅ Strategy reference registered in DataManager "
                     "(trade stream → VolumeProfileAnalyzer active)")
+
+    def _emit_closed_candle(self, timeframe: str, candle: Candle) -> None:
+        if not self._closed_candle_callbacks:
+            return
+        payload = {
+            'o': candle.open,
+            'h': candle.high,
+            'l': candle.low,
+            'c': candle.close,
+            'v': candle.volume,
+            't': int(candle.timestamp * 1000),
+        }
+        for cb in list(self._closed_candle_callbacks):
+            try:
+                cb(timeframe, payload)
+            except Exception as e:
+                logger.debug(f"closed-candle callback error ({timeframe}): {e}")
 
     def stop(self) -> None:
         try:
@@ -733,6 +754,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["1m"] = candle_ts_ms
                     logger.info(f"✅ 1m CLOSED @ ${candle.close:.2f} ({len(self._candles_1m)})")
+                    self._emit_closed_candle("1m", candle)
 
                 self.stats.record_candle()
                 if is_closed:
@@ -776,6 +798,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["5m"] = candle_ts_ms
                     logger.info(f"✅ 5m CLOSED @ ${candle.close:.2f} ({len(self._candles_5m)})")
+                    self._emit_closed_candle("5m", candle)
 
                 self.stats.record_candle()
                 if is_closed:
@@ -819,6 +842,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["15m"] = candle_ts_ms
                     logger.info(f"✅ 15m CLOSED @ ${candle.close:.2f} ({len(self._candles_15m)})")
+                    self._emit_closed_candle("15m", candle)
 
                 self.stats.record_candle()
                 if is_closed:

@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 import config
 from telegram_notifier import send_telegram_message
 from order_manager import GlobalRateLimiter, CancelResult
+from state_machine import TradingStateMachine
 from regime_engine import (
     RegimeEngine, RegimeSnapshot,
     REGIME_TRENDING_BULL, REGIME_TRENDING_BEAR,
@@ -661,8 +662,26 @@ class AdvancedICTStrategy:
 
         # ── Init flag ─────────────────────────────────────────────────────────
         self._initialized = False
+        self._state_machine = TradingStateMachine()
 
         logger.info("✅ AdvancedICTStrategy v9 created")
+
+    def _sm_transition(self, new_state: str, reason: str = "") -> None:
+        try:
+            if self._state_machine.current_state != new_state:
+                self._state_machine.transition(new_state, reason=reason)
+        except Exception:
+            pass
+
+    def on_closed_candle(self, timeframe: str, candle: Dict) -> None:
+        """DataManager callback: emits only on confirmed candle close."""
+        try:
+            if timeframe == "5m":
+                ts = int(candle.get("t", 0))
+                if ts > self._latest_closed_5m_ts:
+                    self._latest_closed_5m_ts = ts
+        except Exception:
+            pass
 
     # =========================================================================
     # GET POSITION (called by main.py)
@@ -672,6 +691,12 @@ class AdvancedICTStrategy:
         """Returns active position dict or None."""
         return (self.active_position
                 if self.state == "POSITION_ACTIVE" else None)
+
+    def get_runtime_state(self) -> str:
+        try:
+            return self._state_machine.current_state
+        except Exception:
+            return self.state
 
     # =========================================================================
     # ON TICK  — main entry point called every 250ms
@@ -697,6 +722,9 @@ class AdvancedICTStrategy:
                 self._run_initialization(data_manager, current_time)
                 return
 
+            if self.state == "READY":
+                self._sm_transition("SCANNING", "ready_for_scan")
+
             # ── Placement lock ────────────────────────────────────────────────
             if (self.state == "READY" and
                     current_time < self._placement_locked_until):
@@ -707,11 +735,14 @@ class AdvancedICTStrategy:
             self._update_amd_phase(current_time)
 
             # ── Structure rebuild ─────────────────────────────────────────────
-            if (current_time - self._last_structure_update_ms
-                    >= self._STRUCTURE_UPDATE_MS):
+            has_new_5m_close = (
+                self._latest_closed_5m_ts > self._last_processed_5m_ts
+            )
+            if has_new_5m_close:
                 self._update_all_structures(
                     data_manager, current_price, current_time)
                 self._last_structure_update_ms = current_time
+                self._last_processed_5m_ts = self._latest_closed_5m_ts
 
             # ── State machine ─────────────────────────────────────────────────
             if self.state == "ENTRY_PENDING":
@@ -3422,6 +3453,7 @@ class AdvancedICTStrategy:
                 "ctx": ctx,
             }
             self.state = "ENTRY_PENDING"
+            self._sm_transition("ENTRY_PENDING", "entry_orders_placed")
             self.total_entries += 1
             self._tce_mark_entry_taken()
 
@@ -3457,6 +3489,7 @@ class AdvancedICTStrategy:
         try:
             if self.entry_pending_start is None:
                 self.state = "READY"
+                self._sm_transition("SCANNING", "pending_without_start")
                 return
 
             timeout_ms = getattr(config, "ENTRY_PENDING_TIMEOUT_SECONDS",
@@ -3482,6 +3515,7 @@ class AdvancedICTStrategy:
                     return
                 logger.info(f"Entry FILLED @ {self.initial_entry_price:.2f}")
                 self.state                 = "POSITION_ACTIVE"
+                self._sm_transition("POSITION_ACTIVE", "entry_filled")
                 self.highest_price_reached = self.initial_entry_price
                 self.lowest_price_reached  = self.initial_entry_price
                 send_telegram_message(
@@ -3537,7 +3571,7 @@ class AdvancedICTStrategy:
                     f"SL={self.current_sl_price:.2f}")
                 pnl = self._calculate_position_pnl(current_price)
                 self._close_position(
-                    order_manager, current_price, "SL_HIT", pnl, current_time)
+                    order_manager, self._risk_manager, current_price, "SL_HIT", pnl, current_time)
                 return
 
             # ── Full TP hit (single TP mode) ──────────────────────────────
@@ -3554,7 +3588,7 @@ class AdvancedICTStrategy:
                     f"TP={self.current_tp_price:.2f}")
                 pnl = self._calculate_position_pnl(current_price)
                 self._close_position(
-                    order_manager, current_price, "TP_HIT", pnl, current_time)
+                    order_manager, self._risk_manager, current_price, "TP_HIT", pnl, current_time)
 
         except Exception as e:
             logger.error(f"❌ Manage position error: {e}", exc_info=True)
@@ -3741,9 +3775,10 @@ class AdvancedICTStrategy:
         else:
             return (self.initial_entry_price - close_price) * qty
 
-    def _close_position(self, order_manager, close_price: float,
+    def _close_position(self, order_manager, risk_manager, close_price: float,
                          reason: str, pnl: float, current_time: int):
         try:
+            self._sm_transition("EXITING", reason)
             side = self.active_position["side"] if self.active_position else "?"
             logger.info(
                 f"📤 CLOSE [{side.upper()}] reason={reason} "
@@ -3821,6 +3856,8 @@ class AdvancedICTStrategy:
 
     def _reset_position_state(self):
         self.state                 = "READY"
+        self._sm_transition("COOLDOWN", "position_reset")
+        self._sm_transition("SCANNING", "cooldown_complete")
         self.active_position       = None
         self.entry_order_id        = None
         self.sl_order_id           = None
@@ -3858,6 +3895,7 @@ class AdvancedICTStrategy:
         self.highest_price_reached = entry_price
         self.lowest_price_reached  = entry_price
         self.state                 = "POSITION_ACTIVE"
+        self._sm_transition("POSITION_ACTIVE", "orphan_adopted")
         logger.info(
             f"🔁 Adopted orphaned {side} @ {entry_price:.2f} "
             f"SL={sl_price:.2f} TP={tp_price:.2f}")
