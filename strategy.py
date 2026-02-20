@@ -655,8 +655,6 @@ class AdvancedICTStrategy:
         self._last_gate_reject_key: Optional[str] = None
         self._last_gate_reject_ms:  int = 0
         self._last_regime_bos_ts:   int = 0
-        self._latest_closed_5m_ts:  int = 0
-        self._last_processed_5m_ts: int = 0
         self._last_sl_hit_time           = 0
         self._placement_locked_until     = 0
         self.last_sl_update              = 0
@@ -1117,6 +1115,7 @@ class AdvancedICTStrategy:
 
         # 2) Firm STF structure confirmation with anti-stall policy:
         #    Prefer 5m+15m agreement; if 15m not available, allow strong 5m with extra support.
+        # 2) Firm STF structure confirmation: latest 5m and 15m BOS/CHoCH must agree
         last_5m = next(
             (ms for ms in reversed(list(self.market_structures))
              if ms.timeframe == "5m"
@@ -3785,8 +3784,14 @@ class AdvancedICTStrategy:
                 f"📤 CLOSE [{side.upper()}] reason={reason} "
                 f"price={close_price:.2f} pnl={pnl:.4f}")
 
-            # Cancel exit orders atomically (TP first then SL)
-            order_manager.cancel_all_exit_orders(self.sl_order_id, self.tp_order_id)
+            # Cancel open orders
+            for oid in filter(None, [
+                self.sl_order_id, self.tp_order_id,
+            ]):
+                try:
+                    order_manager.cancel_order(oid)
+                except Exception:
+                    pass
 
             # Market close remainder
             if self.active_position:
