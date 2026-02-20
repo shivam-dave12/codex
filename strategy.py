@@ -15,11 +15,9 @@ v9 changes over v8
      L3 (1-of-N)        : CVD aligned, absorption event, killzone, TCE bonus
    Score is still computed for logging but cannot override L1/L2/L3 gates.
 
-3. MULTI-TRANCHE EXITS
-   TP1 50 pct qty → first liquidity target / opposing OB
-   TP2 30 pct qty → HTF swing / DR extreme
-   TP3 20 pct qty → ATR trailing SL until stopped
-   TrancheState dataclass tracks fill progression.
+3. SINGLE TP + DYNAMIC STRUCTURE TRAILING
+   One structure-derived TP (CoinSwitch-compatible).
+   Dynamic SL re-anchoring follows swing structure + ATR progression.
 
 4. REGIME-AWARE POSITION SIZING
    RegimeEngine.size_multiplier scales base risk per regime.
@@ -55,6 +53,7 @@ from datetime import datetime, timezone
 import config
 from telegram_notifier import send_telegram_message
 from order_manager import GlobalRateLimiter, CancelResult
+from state_machine import TradingStateMachine
 from regime_engine import (
     RegimeEngine, RegimeSnapshot,
     REGIME_TRENDING_BULL, REGIME_TRENDING_BEAR,
@@ -72,11 +71,6 @@ TCE_MAX_AGE_MS            = 4 * 3600 * 1000
 # Cascade gate
 CASCADE_L2_MIN_TRIGGERS   = 2
 CASCADE_L3_MIN_CONFIRMS   = 1
-
-# Tranche ratios (must sum to 1.0)
-TRANCHE_1_RATIO           = 0.50
-TRANCHE_2_RATIO           = 0.30
-TRANCHE_3_RATIO           = 0.20
 
 # Self-adaptation
 ADAPTATION_MIN_SAMPLES    = 20
@@ -103,7 +97,8 @@ DR_TP1_ZONE_PCT           = 0.50   # equilibrium of current DR
 DR_TP2_ZONE_PCT           = 0.79   # OTE edge of opposing DR
 
 # Neutral HTF handling (micro-bias execution profile)
-MICRO_BIAS_MSS_WINDOW_MS  = 45 * 60_000
+MICRO_BIAS_5M_WINDOW_MS   = 45 * 60_000
+MICRO_BIAS_15M_WINDOW_MS  = 180 * 60_000
 MICRO_BIAS_MSS_MAX_WEIGHT = 0.35
 MICRO_BIAS_DAILY_WEIGHT   = 0.45
 MICRO_BIAS_CVD_WEIGHT     = 0.20
@@ -329,27 +324,6 @@ class DealingRange:
     def is_equilibrium(self, price: float) -> bool:
         p = self.zone_pct(price)
         return 0.382 <= p <= 0.618
-
-@dataclass
-class TrancheState:
-    """
-    Tracks multi-tranche exit lifecycle.
-    Created on entry, updated as each TP fills.
-    """
-    full_qty:         float
-    qty_tp1:          float
-    qty_tp2:          float
-    qty_tp3:          float
-    tp1_price:        float
-    tp2_price:        float
-    tp1_order_id:     Optional[str]  = None
-    tp2_order_id:     Optional[str]  = None
-    tranche_index:    int            = 0     # 0=none, 1=tp1 filled, 2=tp2 filled
-    tp1_filled:       bool           = False
-    tp2_filled:       bool           = False
-    realized_pnl_tp1: float          = 0.0
-    realized_pnl_tp2: float          = 0.0
-    trail_active:     bool           = False
 
 @dataclass
 class RegimePerformanceRecord:
@@ -650,7 +624,6 @@ class AdvancedICTStrategy:
         self.entry_order_id:   Optional[str]          = None
         self.sl_order_id:      Optional[str]          = None
         self.tp_order_id:      Optional[str]          = None
-        self._tranche:         Optional[TrancheState] = None
         self._pending_ctx:     Optional[TriggerContext] = None
 
         self.initial_entry_price:   Optional[float] = None
@@ -679,6 +652,11 @@ class AdvancedICTStrategy:
         # ── Timing ────────────────────────────────────────────────────────────
         self._last_structure_update_ms   = 0
         self._last_entry_eval_ms         = 0
+        self._last_gate_reject_key: Optional[str] = None
+        self._last_gate_reject_ms:  int = 0
+        self._last_regime_bos_ts:   int = 0
+        self._latest_closed_5m_ts:  int = 0
+        self._last_processed_5m_ts: int = 0
         self._last_sl_hit_time           = 0
         self._placement_locked_until     = 0
         self.last_sl_update              = 0
@@ -686,8 +664,26 @@ class AdvancedICTStrategy:
 
         # ── Init flag ─────────────────────────────────────────────────────────
         self._initialized = False
+        self._state_machine = TradingStateMachine()
 
         logger.info("✅ AdvancedICTStrategy v9 created")
+
+    def _sm_transition(self, new_state: str, reason: str = "") -> None:
+        try:
+            if self._state_machine.current_state != new_state:
+                self._state_machine.transition(new_state, reason=reason)
+        except Exception:
+            pass
+
+    def on_closed_candle(self, timeframe: str, candle: Dict) -> None:
+        """DataManager callback: emits only on confirmed candle close."""
+        try:
+            if timeframe == "5m":
+                ts = int(candle.get("t", 0))
+                if ts > self._latest_closed_5m_ts:
+                    self._latest_closed_5m_ts = ts
+        except Exception:
+            pass
 
     # =========================================================================
     # GET POSITION (called by main.py)
@@ -698,6 +694,12 @@ class AdvancedICTStrategy:
         return (self.active_position
                 if self.state == "POSITION_ACTIVE" else None)
 
+    def get_runtime_state(self) -> str:
+        try:
+            return self._state_machine.current_state
+        except Exception:
+            return self.state
+
     # =========================================================================
     # ON TICK  — main entry point called every 250ms
     # =========================================================================
@@ -705,6 +707,14 @@ class AdvancedICTStrategy:
     def on_tick(self, data_manager, order_manager, risk_manager,
                 current_time: int) -> None:
         try:
+            # Backward-compatible runtime guards (handles hot-reload/old objects)
+            if not hasattr(self, "_latest_closed_5m_ts"):
+                self._latest_closed_5m_ts = 0
+            if not hasattr(self, "_last_processed_5m_ts"):
+                self._last_processed_5m_ts = 0
+            if not hasattr(self, "_state_machine"):
+                self._state_machine = TradingStateMachine()
+
             # Store risk_manager ref (used in _close_position)
             if self._risk_manager is None:
                 self._risk_manager = risk_manager
@@ -722,6 +732,9 @@ class AdvancedICTStrategy:
                 self._run_initialization(data_manager, current_time)
                 return
 
+            if self.state == "READY":
+                self._sm_transition("SCANNING", "ready_for_scan")
+
             # ── Placement lock ────────────────────────────────────────────────
             if (self.state == "READY" and
                     current_time < self._placement_locked_until):
@@ -732,11 +745,14 @@ class AdvancedICTStrategy:
             self._update_amd_phase(current_time)
 
             # ── Structure rebuild ─────────────────────────────────────────────
-            if (current_time - self._last_structure_update_ms
-                    >= self._STRUCTURE_UPDATE_MS):
+            has_new_5m_close = (
+                self._latest_closed_5m_ts > self._last_processed_5m_ts
+            )
+            if has_new_5m_close:
                 self._update_all_structures(
                     data_manager, current_price, current_time)
                 self._last_structure_update_ms = current_time
+                self._last_processed_5m_ts = self._latest_closed_5m_ts
 
             # ── State machine ─────────────────────────────────────────────────
             if self.state == "ENTRY_PENDING":
@@ -902,12 +918,12 @@ class AdvancedICTStrategy:
 
             # ── OB visit count update ─────────────────────────────────────────
             for ob in list(self.order_blocks_bull) + list(self.order_blocks_bear):
-                if (not ob.broken and
-                        ob.is_active(current_time) and
-                        ob.contains_price(current_price)):
-                    # Increment only once per OB until price leaves the zone
-                    # (handled by tracking ob.visit_count in detection above)
-                    pass
+                if not ob.broken and ob.is_active(current_time):
+                    was_in_zone = getattr(ob, '_price_was_in_zone', False)
+                    now_in_zone = ob.contains_price(current_price)
+                    if now_in_zone and not was_in_zone:
+                        ob.visit_count += 1
+                    ob._price_was_in_zone = now_in_zone
 
             # ── Market structure ──────────────────────────────────────────────
             prev_bias = self.htf_bias
@@ -941,9 +957,13 @@ class AdvancedICTStrategy:
                  if ms.structure_type == "BOS"
                  and (current_time - ms.timestamp) < 300_000),
                 None)
+            bos_dir_for_regime = None
+            if recent_bos and recent_bos.timestamp != self._last_regime_bos_ts:
+                bos_dir_for_regime = recent_bos.direction
+                self._last_regime_bos_ts = recent_bos.timestamp
             self.regime_engine.update(
                 c5m, c1h, current_price, current_time,
-                recent_bos.direction if recent_bos else None)
+                bos_dir_for_regime)
 
             # ── Volume / liquidity model ──────────────────────────────────────
             if self.volume_analyzer and c5m:
@@ -998,9 +1018,8 @@ class AdvancedICTStrategy:
 
             # 2. EMA slope (20%)
             if len(closes) >= ema_period + 4:
-                ema_now  = self._calculate_ema(closes,      ema_period)
                 ema_prev = self._calculate_ema(closes[:-4], ema_period)
-                if ema_now > ema_prev:
+                if ema_val > ema_prev:
                     bull += 0.20; comp["ema_slope"] = "BULL"
                 else:
                     bear += 0.20; comp["ema_slope"] = "BEAR"
@@ -1064,9 +1083,9 @@ class AdvancedICTStrategy:
     def _update_daily_bias(self, candles_5m: List[Dict],
                             current_price: float) -> None:
         try:
-            if len(candles_5m) < 20:
+            if len(candles_5m) < 80:
                 return
-            closes      = [float(c['c']) for c in candles_5m[-20:]]
+            closes      = [float(c['c']) for c in candles_5m[-80:]]
             ema_fast    = self._calculate_ema(closes, 8)
             ema_slow    = self._calculate_ema(closes, 20)
             recent_avg  = sum(closes[-4:]) / 4
@@ -1084,7 +1103,7 @@ class AdvancedICTStrategy:
         """
         Returns execution bias used by entry engine.
         - If HTF bias is directional, it is authoritative.
-        - If HTF is neutral, derive direction from small-timeframe structure.
+        - If HTF is neutral, require firm STF structure confirmation.
         """
         if self.htf_bias in ("BULLISH", "BEARISH"):
             return self.htf_bias, self.htf_bias_strength, {"htf": self.htf_bias_strength}
@@ -1093,36 +1112,59 @@ class AdvancedICTStrategy:
         bear = 0.0
         components: Dict[str, float] = {}
 
-        # 1) 5m directional bias proxy
+        # 1) Daily directional context (supportive, not decisive)
+        daily_dir = "NEUTRAL"
         if self.daily_bias == "BULLISH":
             bull += MICRO_BIAS_DAILY_WEIGHT
             components["daily"] = MICRO_BIAS_DAILY_WEIGHT
+            daily_dir = "BULLISH"
         elif self.daily_bias == "BEARISH":
             bear += MICRO_BIAS_DAILY_WEIGHT
             components["daily"] = -MICRO_BIAS_DAILY_WEIGHT
+            daily_dir = "BEARISH"
 
-        # 2) Most recent 5m/15m MSS with age-decayed confidence
-        recent_mss = [
-            ms for ms in reversed(list(self.market_structures))
-            if ms.timeframe in ("5m", "15m")
-            and ms.structure_type in ("BOS", "CHoCH")
-            and (current_time - ms.timestamp) <= MICRO_BIAS_MSS_WINDOW_MS
-        ]
-        mss_weight_used = 0.0
-        for ms in recent_mss[:3]:
-            age_f = max(0.0, 1.0 - (current_time - ms.timestamp) / MICRO_BIAS_MSS_WINDOW_MS)
-            add_w = min(0.20 * age_f, MICRO_BIAS_MSS_MAX_WEIGHT - mss_weight_used)
-            if add_w <= 0:
-                break
-            if ms.direction == "bullish":
-                bull += add_w
-            elif ms.direction == "bearish":
-                bear += add_w
-            mss_weight_used += add_w
-        if mss_weight_used > 0:
-            components["mss"] = mss_weight_used if bull >= bear else -mss_weight_used
+        # 2) Firm STF structure confirmation with anti-stall policy:
+        #    Prefer 5m+15m agreement; if 15m not available, allow strong 5m with extra support.
+        last_5m = next(
+            (ms for ms in reversed(list(self.market_structures))
+             if ms.timeframe == "5m"
+             and ms.structure_type in ("BOS", "CHoCH")
+             and (current_time - ms.timestamp) <= MICRO_BIAS_5M_WINDOW_MS),
+            None,
+        )
+        last_15m = next(
+            (ms for ms in reversed(list(self.market_structures))
+             if ms.timeframe == "15m"
+             and ms.structure_type in ("BOS", "CHoCH")
+             and (current_time - ms.timestamp) <= MICRO_BIAS_15M_WINDOW_MS),
+            None,
+        )
 
-        # 3) CVD alignment confirmation
+        if not last_5m and not last_15m:
+            return "NEUTRAL", 0.0, components
+
+        strict_agreement = (last_5m is not None and last_15m is not None)
+        if strict_agreement and last_5m.direction != last_15m.direction:
+            return "NEUTRAL", 0.0, components
+
+        if strict_agreement:
+            structural_dir = "BULLISH" if last_5m.direction == "bullish" else "BEARISH"
+            structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT
+        else:
+            # Only one structure source available -> reduced structural confidence.
+            anchor = last_5m or last_15m
+            structural_dir = "BULLISH" if anchor.direction == "bullish" else "BEARISH"
+            structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT * 0.65
+
+        if structural_dir == "BULLISH":
+            bull += structural_weight
+            components["mss"] = structural_weight
+        else:
+            bear += structural_weight
+            components["mss"] = -structural_weight
+
+        # 3) CVD momentum confirmation (supportive)
+        cvd_dir = "NEUTRAL"
         if self.volume_analyzer and len(self.volume_analyzer.cvd_history) >= 10:
             cvd_sig = self.volume_analyzer.get_cvd_signal(lookback=80)
             signal = cvd_sig.get("signal", "NEUTRAL")
@@ -1130,29 +1172,56 @@ class AdvancedICTStrategy:
                 w = MICRO_BIAS_CVD_WEIGHT if signal == "BULL" else MICRO_BIAS_CVD_WEIGHT * 1.2
                 bull += w
                 components["cvd"] = w
+                cvd_dir = "BULLISH"
             elif "BEAR" in signal:
                 w = MICRO_BIAS_CVD_WEIGHT if signal == "BEAR" else MICRO_BIAS_CVD_WEIGHT * 1.2
                 bear += w
                 components["cvd"] = -w
+                cvd_dir = "BEARISH"
 
         edge = abs(bull - bear)
         strength = min(max(max(bull, bear), 0.0), 1.0)
 
-        if edge < MICRO_BIAS_MIN_EDGE:
-            # Tie-breaker uses freshest small-timeframe structure only.
-            freshest = next(
-                (ms for ms in reversed(list(self.market_structures))
-                 if ms.timeframe in ("5m", "15m")
-                 and ms.structure_type in ("BOS", "CHoCH")),
-                None,
-            )
-            if freshest is None:
-                return "NEUTRAL", strength, components
-            return ("BULLISH" if freshest.direction == "bullish" else "BEARISH",
-                    strength,
-                    components)
+        # Firmness gate: when 5m+15m agree -> require 1 supporter;
+        # when only one timeframe structure is available -> require 2 supporters.
+        supporters = 0
+        if daily_dir == structural_dir:
+            supporters += 1
+        if cvd_dir == structural_dir:
+            supporters += 1
 
-        return ("BULLISH", strength, components) if bull > bear else ("BEARISH", strength, components)
+        min_supporters = 1 if strict_agreement else 2
+        min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
+        if supporters < min_supporters or edge < min_edge:
+            return "NEUTRAL", strength, components
+
+        return structural_dir, strength, components
+
+    def _calculate_micro_bias_score(self, current_time: int) -> float:
+        """Micro-bias strength score (0-100) for neutral-HTF threshold override."""
+        try:
+            bias, strength, components = self._resolve_directional_bias(current_time)
+            if bias == "NEUTRAL":
+                return 0.0
+
+            score = max(0.0, min(100.0, strength * 100.0))
+
+            # Require structure + at least one supporting component for high confidence.
+            has_mss = abs(float(components.get("mss", 0.0))) > 0
+            supporters = 0
+            if abs(float(components.get("daily", 0.0))) > 0:
+                supporters += 1
+            if abs(float(components.get("cvd", 0.0))) > 0:
+                supporters += 1
+
+            if not has_mss:
+                return 0.0
+            if supporters == 0:
+                score *= 0.7
+
+            return score
+        except Exception:
+            return 0.0
 
     # =========================================================================
     # NESTED DEALING RANGES  (3-tier IPDA)
@@ -1449,17 +1518,18 @@ class AdvancedICTStrategy:
                     100)
 
                 # Check inducement: was there a sweep just before this OB?
+                cur_ts_ms = self._ts_ms(cur)
                 inducement = any(
                     lp.swept and lp.pool_type == "EQL"
                     and abs(lp.price - cur_l) / current_price * 100 < 0.5
-                    and lp.sweep_timestamp < cur['t']
+                    and lp.sweep_timestamp < cur_ts_ms
                     for lp in self.liquidity_pools)
 
                 if not any(abs(ob.low - cur_l) <= tol and
                            abs(ob.high - cur_h) <= tol
                            for ob in self.order_blocks_bull):
                     self.order_blocks_bull.append(OrderBlock(
-                        low=cur_l, high=cur_h, timestamp=cur['t'],
+                        low=cur_l, high=cur_h, timestamp=cur_ts_ms,
                         has_wick_rejection=wick_rej, strength=strength,
                         direction="bullish", has_displacement=has_disp,
                         inducement_near=inducement, bos_confirmed=bos_ok,
@@ -1478,17 +1548,18 @@ class AdvancedICTStrategy:
                     (10 if wick_rej else 0),
                     100)
 
+                cur_ts_ms = self._ts_ms(cur)
                 inducement = any(
                     lp.swept and lp.pool_type == "EQH"
                     and abs(lp.price - cur_h) / current_price * 100 < 0.5
-                    and lp.sweep_timestamp < cur['t']
+                    and lp.sweep_timestamp < cur_ts_ms
                     for lp in self.liquidity_pools)
 
                 if not any(abs(ob.low - cur_l) <= tol and
                            abs(ob.high - cur_h) <= tol
                            for ob in self.order_blocks_bear):
                     self.order_blocks_bear.append(OrderBlock(
-                        low=cur_l, high=cur_h, timestamp=cur['t'],
+                        low=cur_l, high=cur_h, timestamp=cur_ts_ms,
                         has_wick_rejection=wick_rej, strength=strength,
                         direction="bearish", has_displacement=has_disp,
                         inducement_near=inducement, bos_confirmed=bos_ok,
@@ -1520,7 +1591,7 @@ class AdvancedICTStrategy:
                                for f in self.fvgs_bull):
                         self.fvgs_bull.append(FairValueGap(
                             bottom=c1_h, top=c3_l,
-                            timestamp=candles[i]['t'],
+                            timestamp=self._ts_ms(candles[i]),
                             direction="bullish"))
 
             # Bearish FVG: c1 low > c3 high
@@ -1532,7 +1603,7 @@ class AdvancedICTStrategy:
                                for f in self.fvgs_bear):
                         self.fvgs_bear.append(FairValueGap(
                             bottom=c3_h, top=c1_l,
-                            timestamp=candles[i]['t'],
+                            timestamp=self._ts_ms(candles[i]),
                             direction="bearish"))
 
     def _update_fvg_fills(self, candles: List[Dict]):
@@ -2302,8 +2373,11 @@ class AdvancedICTStrategy:
                     fvg.filled = True
 
         # Purge old sweeps from dedup set to avoid unbounded growth
-        if len(self._registered_sweeps) > 5000:
-            self._registered_sweeps.clear()
+        cutoff = current_time - 48 * 3_600_000
+        self._registered_sweeps = {
+            key for key in self._registered_sweeps
+            if key[1] > cutoff
+        }
 
     # =========================================================================
     # FAILED SETUP INTELLIGENCE (unchanged from v8)
@@ -2901,6 +2975,18 @@ class AdvancedICTStrategy:
 
         return len(met), met
 
+    def _log_gate_reject(self, level: str, side: str,
+                         detail: str, current_time: int) -> None:
+        """Debounced gate-rejection logging to avoid repeated spam."""
+        throttle_ms = 20_000
+        key = f"{level}:{side}:{detail}"
+        if (key == self._last_gate_reject_key
+                and (current_time - self._last_gate_reject_ms) < throttle_ms):
+            return
+        self._last_gate_reject_key = key
+        self._last_gate_reject_ms = current_time
+        logger.info(f"❌ {level} [{side}]: {detail}")
+
     # =========================================================================
     # ENTRY EVALUATION — FULL CASCADE
     # =========================================================================
@@ -2922,6 +3008,19 @@ class AdvancedICTStrategy:
                                  if hasattr(data_manager, "get_candles") else None
             tce_state          = self._tce_update(
                 current_price, current_time, candles_5m=candles_5m)
+
+            # Anti-deadlock: stale AWAITING_CONFIRMATION must not block forever.
+            if (self._active_tce is not None and
+                    self._active_tce.tce_state == "AWAITING_CONFIRMATION"):
+                age_min = ((current_time - self._active_tce.bias_change_time)
+                           / 60_000)
+                if age_min > 15:
+                    logger.info(
+                        "TCE auto-expired after 15 min — resuming normal scanning")
+                    self._active_tce.expired_reason = "Auto-expired after stale confirmation"
+                    self._active_tce.expire_time = current_time
+                    self._active_tce.tce_state = "EXPIRED"
+
             score_bonus, gate_desc = self._tce_get_entry_modifier()
 
             # ── TCE hard gate with expansion bypass ───────────────────────
@@ -2992,13 +3091,20 @@ class AdvancedICTStrategy:
                 base_threshold = config.ENTRY_THRESHOLD_KILLZONE
             else:
                 base_threshold = config.ENTRY_THRESHOLD_REGULAR
+
+            # Ranging regime requires lower threshold to avoid permanent no-trade lock.
+            if rs.regime == REGIME_RANGING:
+                base_threshold = min(base_threshold, 72)
+
             threshold  = (base_threshold * rs.entry_threshold_modifier
                           + self._get_adaptive_threshold_add())
 
-            # Neutral HTF mode is tradable, but requires tighter execution.
+            # Neutral HTF mode uses micro-bias override instead of blanket penalty.
             neutral_trade_mode = (self.htf_bias == "NEUTRAL")
             if neutral_trade_mode:
-                threshold += 5.0
+                micro_score = self._calculate_micro_bias_score(current_time)
+                if micro_score >= 65:
+                    threshold = min(threshold, 70.0)
 
             # ── Near-miss reporting ───────────────────────────────────────
             if (long_score >= 75 or short_score >= 75) and \
@@ -3023,25 +3129,29 @@ class AdvancedICTStrategy:
                 l1_ok, l1_reason = self._cascade_l1_pass(
                     side, current_price, current_time)
                 if not l1_ok:
-                    logger.info(f"❌ L1 [{side}]: {l1_reason}")
+                    self._log_gate_reject("L1", side, l1_reason, current_time)
                     continue
 
                 # L2 gate
                 l2_count, l2_met = self._cascade_l2_triggers(
                     side, current_price, s_ctx, current_time)
                 if l2_count < CASCADE_L2_MIN_TRIGGERS:
-                    logger.info(
-                        f"❌ L2 [{side}]: {l2_count}/{CASCADE_L2_MIN_TRIGGERS} "
-                        f"triggers {l2_met}")
+                    self._log_gate_reject(
+                        "L2", side,
+                        f"{l2_count}/{CASCADE_L2_MIN_TRIGGERS} triggers {l2_met}",
+                        current_time,
+                    )
                     continue
 
                 # L3 gate
                 l3_count, l3_met = self._cascade_l3_confirmations(
                     side, current_price, s_ctx, s_score, score_bonus)
                 if l3_count < CASCADE_L3_MIN_CONFIRMS:
-                    logger.info(
-                        f"❌ L3 [{side}]: {l3_count}/{CASCADE_L3_MIN_CONFIRMS} "
-                        f"confirms {l3_met}")
+                    self._log_gate_reject(
+                        "L3", side,
+                        f"{l3_count}/{CASCADE_L3_MIN_CONFIRMS} confirms {l3_met}",
+                        current_time,
+                    )
                     continue
 
                 logger.info(
@@ -3073,7 +3183,7 @@ class AdvancedICTStrategy:
             logger.error(f"❌ Entry evaluation error: {e}", exc_info=True)
 
     # =========================================================================
-    # COHERENT LEVEL CALCULATION (unchanged from v8, DR-aware TP)
+    # COHERENT LEVEL CALCULATION (strict, structure-derived)
     # =========================================================================
 
     def _find_neutral_tp(self, side: str, entry_price: float, current_time: int) -> Optional[float]:
@@ -3168,18 +3278,15 @@ class AdvancedICTStrategy:
                         tp2_cand = dr.high
                         if tp2_cand > entry_price:
                             tp2 = tp2_cand
-                    if tp2 is None and tp1 is not None:
-                        tp2 = entry_price + (tp1 - entry_price) * 2.0
-
-                    if tp2 is not None and tp2 > entry_price:
-                        tp_final = tp2
-                    else:
-                        tp_final = entry_price + risk * config.TARGET_RISK_REWARD_RATIO
+                    # Require explicit DR/HTF structural target for TP2.
+                    if tp2 is None or tp2 <= entry_price:
+                        return None, None, None, None, None
+                    tp_final = tp2
 
                     if tp_final is not None:
                         rr_final = (tp_final - entry_price) / risk if risk > 0 else 0
-                        if rr_final > getattr(config, "MAX_RR_RATIO", 10):
-                            tp_final = (entry_price + risk * getattr(config, "MAX_RR_RATIO", 10))
+                        if rr_final > config.MAX_RR_RATIO:
+                            tp_final = (entry_price + risk * config.MAX_RR_RATIO)
 
             else:  # short
                 entry_price = current_price + entry_offset
@@ -3229,16 +3336,15 @@ class AdvancedICTStrategy:
                         tp2_cand = dr.low
                         if tp2_cand < entry_price:
                             tp2 = tp2_cand
-                    if tp2 is None and tp1 is not None:
-                        tp2 = entry_price - (entry_price - tp1) * 2.0
-
-                    tp_final = (tp2 if tp2 is not None and tp2 < entry_price
-                                else entry_price - risk * config.TARGET_RISK_REWARD_RATIO)
+                    # Require explicit DR/HTF structural target for TP2.
+                    if tp2 is None or tp2 >= entry_price:
+                        return None, None, None, None, None
+                    tp_final = tp2
 
                     if tp_final is not None:
                         rr_final = (entry_price - tp_final) / risk if risk > 0 else 0
-                        if rr_final > getattr(config, "MAX_RR_RATIO", 10):
-                            tp_final = (entry_price - risk * getattr(config, "MAX_RR_RATIO", 10))
+                        if rr_final > config.MAX_RR_RATIO:
+                            tp_final = (entry_price - risk * config.MAX_RR_RATIO)
 
             entry_price = round(entry_price / tick) * tick
             sl_price    = round(sl_price    / tick) * tick
@@ -3246,41 +3352,16 @@ class AdvancedICTStrategy:
             tp1         = round(tp1         / tick) * tick if tp1      else None
             tp2         = round(tp2         / tick) * tick if tp2      else None
 
+            if side == "long" and not (sl_price < entry_price < tp_final):
+                return None, None, None, None, None
+            if side == "short" and not (tp_final < entry_price < sl_price):
+                return None, None, None, None, None
+
             return entry_price, sl_price, tp_final, tp1, tp2
 
         except Exception as e:
             logger.error(f"❌ Coherent levels error: {e}", exc_info=True)
             return None, None, None, None, None
-
-    # =========================================================================
-    # BUILD TRANCHE STATE (v9)
-    # =========================================================================
-
-    def _build_tranche_state(
-            self, side: str, entry_price: float,
-            sl_price: float, tp1: Optional[float],
-            tp2: Optional[float], position_size: float,
-    ) -> TrancheState:
-        risk = abs(entry_price - sl_price)
-        qty1 = round(position_size * TRANCHE_1_RATIO, 8)
-        qty2 = round(position_size * TRANCHE_2_RATIO, 8)
-        qty3 = round(position_size * TRANCHE_3_RATIO, 8)
-
-        # TP1 default: 1.5× risk
-        if tp1 is None:
-            tp1 = (entry_price + risk * 1.5 if side == "long"
-                   else entry_price - risk * 1.5)
-        # TP2 default: 2.5× risk
-        if tp2 is None:
-            tp2 = (entry_price + risk * 2.5 if side == "long"
-                   else entry_price - risk * 2.5)
-
-        return TrancheState(
-            full_qty=position_size,
-            qty_tp1=qty1, qty_tp2=qty2, qty_tp3=qty3,
-            tp1_price=round(tp1 / config.TICK_SIZE) * config.TICK_SIZE,
-            tp2_price=round(tp2 / config.TICK_SIZE) * config.TICK_SIZE,
-        )
 
     # =========================================================================
     # EXECUTE ENTRY
@@ -3307,13 +3388,15 @@ class AdvancedICTStrategy:
             # Sanity checks
             if side == "long":
                 if sl_price >= entry_price:
-                    sl_price = entry_price * (1 - 0.005)
+                    logger.error("⚠️ Invalid LONG levels: SL >= Entry")
+                    return
                 if tp_price is not None and tp_price <= entry_price:
                     logger.error("⚠️ TP ≤ Entry for LONG — skipping")
                     return
             else:
                 if sl_price <= entry_price:
-                    sl_price = entry_price * (1 + 0.005)
+                    logger.error("⚠️ Invalid SHORT levels: SL <= Entry")
+                    return
                 if tp_price is not None and tp_price >= entry_price:
                     logger.error("⚠️ TP ≥ Entry for SHORT — skipping")
                     return
@@ -3342,6 +3425,12 @@ class AdvancedICTStrategy:
                 position_size * rs.size_multiplier * dr_m * adapt_m * neutral_size_mult, 8)
             if position_size <= 0:
                 logger.warning("⚠️ Position size zeroed by multipliers")
+                return
+
+            min_qty = getattr(config, "MIN_ORDER_QTY", 0.001)
+            if position_size < min_qty:
+                logger.warning(
+                    f"⚠️ Position size {position_size:.6f} < min_qty {min_qty} — skipped")
                 return
 
             logger.info(
@@ -3380,30 +3469,29 @@ class AdvancedICTStrategy:
             logger.info(f"✅ SL placed {sl_order_id} @ {sl_price:.2f}")
             time.sleep(0.3)
 
-            # Place TP1 (50% size)
-            tranche = self._build_tranche_state(
-                side, entry_price, sl_price, tp1, tp2, position_size)
+            # Place single structure-based TP (CoinSwitch-compatible)
             GlobalRateLimiter.wait()
-            tp1_resp = order_manager.place_take_profit(
-                side=exit_side, quantity=tranche.qty_tp1,
-                trigger_price=tranche.tp1_price)
-            tranche.tp1_order_id = tp1_resp.get("order_id") \
-                                   if tp1_resp else None
-            if tranche.tp1_order_id:
-                logger.info(
-                    f"✅ TP1 placed {tranche.tp1_order_id} "
-                    f"@ {tranche.tp1_price:.2f} qty={tranche.qty_tp1}")
+            tp_resp = order_manager.place_take_profit(
+                side=exit_side, quantity=position_size,
+                trigger_price=tp_price)
+            tp_order_id = tp_resp.get("order_id") if tp_resp else None
+            if not tp_order_id:
+                logger.error("❌ TP placement failed — cancelling entry and SL to avoid naked exposure")
+                order_manager.cancel_order(entry_order_id)
+                order_manager.cancel_order(sl_order_id)
+                self._placement_locked_until = (
+                    current_time + PLACEMENT_LOCK_SECONDS * 1000)
+                return
+            logger.info(
+                f"✅ TP placed {tp_order_id} "
+                f"@ {tp_price:.2f} qty={position_size}")
             time.sleep(0.3)
-
-            # Legacy tp_order_id kept for compatibility
-            tp_order_id = tranche.tp1_order_id
 
             # Commit state
             self.entry_order_id        = entry_order_id
             self.sl_order_id           = sl_order_id
             self.tp_order_id           = tp_order_id
             self._pending_ctx          = ctx
-            self._tranche              = tranche
             self.initial_entry_price   = entry_price
             self.initial_sl_price      = sl_price
             self.initial_tp_price      = tp_price
@@ -3420,6 +3508,7 @@ class AdvancedICTStrategy:
                 "ctx": ctx,
             }
             self.state = "ENTRY_PENDING"
+            self._sm_transition("ENTRY_PENDING", "entry_orders_placed")
             self.total_entries += 1
             self._tce_mark_entry_taken()
 
@@ -3438,8 +3527,7 @@ class AdvancedICTStrategy:
                 f"Entry: {entry_price:.2f} | SL: {sl_price:.2f} | "
                 f"TP: {tp_price:.2f}\n"
                 f"RR: {rr:.2f}:1 | Qty: {position_size}\n"
-                f"TP1: {tranche.tp1_price:.2f} ({TRANCHE_1_RATIO:.0%}) | "
-                f"TP2: {tranche.tp2_price:.2f} ({TRANCHE_2_RATIO:.0%})\n"
+                f"Mode: Single TP + Dynamic SL trail\n"
                 f"Regime: {rs.regime} | {dr_tag}\n"
                 f"Preserve: {self._capital_preserve_mode}\n"
                 + "\n".join(f"• {r}" for r in reasons[:5]))
@@ -3456,6 +3544,7 @@ class AdvancedICTStrategy:
         try:
             if self.entry_pending_start is None:
                 self.state = "READY"
+                self._sm_transition("SCANNING", "pending_without_start")
                 return
 
             timeout_ms = getattr(config, "ENTRY_PENDING_TIMEOUT_SECONDS",
@@ -3466,8 +3555,8 @@ class AdvancedICTStrategy:
                     order_manager.cancel_order(self.entry_order_id)
                 if self.sl_order_id:
                     order_manager.cancel_order(self.sl_order_id)
-                if self._tranche and self._tranche.tp1_order_id:
-                    order_manager.cancel_order(self._tranche.tp1_order_id)
+                if self.tp_order_id:
+                    order_manager.cancel_order(self.tp_order_id)
                 self._reset_position_state()
                 send_telegram_message("⏱️ Entry pending timeout — cancelled")
                 return
@@ -3481,6 +3570,7 @@ class AdvancedICTStrategy:
                     return
                 logger.info(f"Entry FILLED @ {self.initial_entry_price:.2f}")
                 self.state                 = "POSITION_ACTIVE"
+                self._sm_transition("POSITION_ACTIVE", "entry_filled")
                 self.highest_price_reached = self.initial_entry_price
                 self.lowest_price_reached  = self.initial_entry_price
                 send_telegram_message(
@@ -3514,10 +3604,6 @@ class AdvancedICTStrategy:
                         current_price < self.lowest_price_reached:
                     self.lowest_price_reached = current_price
 
-            # ── Tranche fill check ────────────────────────────────────────
-            self._check_tranche_fills(
-                current_price, order_manager, current_time)
-
             # ── SL health / dynamic stop ──────────────────────────────────
             if (current_time - self.last_sl_update) > \
                     getattr(config, "SL_UPDATE_INTERVAL_SECONDS", 30) * 1000:
@@ -3540,10 +3626,10 @@ class AdvancedICTStrategy:
                     f"SL={self.current_sl_price:.2f}")
                 pnl = self._calculate_position_pnl(current_price)
                 self._close_position(
-                    order_manager, current_price, "SL_HIT", pnl, current_time)
+                    order_manager, self._risk_manager, current_price, "SL_HIT", pnl, current_time)
                 return
 
-            # ── Full TP hit (tp3 trail leg) ───────────────────────────────
+            # ── Full TP hit (single TP mode) ──────────────────────────────
             tp_hit = False
             if self.current_tp_price:
                 if side == "long"  and current_price >= self.current_tp_price:
@@ -3551,100 +3637,61 @@ class AdvancedICTStrategy:
                 elif side == "short" and current_price <= self.current_tp_price:
                     tp_hit = True
 
-            if tp_hit and (not self._tranche or
-                           self._tranche.tranche_index >= 2):
+            if tp_hit:
                 logger.info(
                     f"🎉 TP HIT [{side}] @ {current_price:.2f} "
                     f"TP={self.current_tp_price:.2f}")
                 pnl = self._calculate_position_pnl(current_price)
                 self._close_position(
-                    order_manager, current_price, "TP_HIT", pnl, current_time)
+                    order_manager, self._risk_manager, current_price, "TP_HIT", pnl, current_time)
 
         except Exception as e:
             logger.error(f"❌ Manage position error: {e}", exc_info=True)
 
     # =========================================================================
-    # TRANCHE FILL CHECKER (v9)
-    # =========================================================================
-
-    def _check_tranche_fills(self, current_price: float,
-                               order_manager, current_time: int):
-        """
-        Checks TP1 / TP2 price levels by price comparison
-        (exchange fill callback is handled by order_manager separately).
-        On TP1 fill: move SL to breakeven, cancel TP1 order if still open.
-        On TP2 fill: activate trailing for TP3 remainder.
-        """
-        if not self._tranche or not self.active_position:
-            return
-        tr   = self._tranche
-        side = self.active_position["side"]
-
-        # TP1
-        if not tr.tp1_filled:
-            tp1_hit = (current_price >= tr.tp1_price if side == "long"
-                       else current_price <= tr.tp1_price)
-            if tp1_hit:
-                tr.tp1_filled     = True
-                tr.tranche_index  = 1
-                pnl_tp1           = abs(tr.tp1_price -
-                                         self.initial_entry_price) * tr.qty_tp1
-                tr.realized_pnl_tp1 = pnl_tp1
-                logger.info(
-                    f"💰 TP1 FILLED {side} @ {tr.tp1_price:.2f} "
-                    f"qty={tr.qty_tp1} pnl≈{pnl_tp1:.2f}")
-
-                # Move SL to breakeven
-                if self.initial_entry_price and self.current_sl_price:
-                    new_sl = self.initial_entry_price
-                    if side == "long" and new_sl > self.current_sl_price:
-                        self._move_sl(new_sl, order_manager, "BREAKEVEN_TP1")
-                    elif side == "short" and new_sl < self.current_sl_price:
-                        self._move_sl(new_sl, order_manager, "BREAKEVEN_TP1")
-
-                # Place TP2 order
-                GlobalRateLimiter.wait()
-                exit_side = "SHORT" if side == "long" else "LONG"
-                tp2_resp  = order_manager.place_take_profit(
-                    side=exit_side, quantity=tr.qty_tp2,
-                    trigger_price=tr.tp2_price)
-                tr.tp2_order_id = tp2_resp.get("order_id") if tp2_resp else None
-                if tr.tp2_order_id:
-                    logger.info(
-                        f"✅ TP2 placed {tr.tp2_order_id} "
-                        f"@ {tr.tp2_price:.2f} qty={tr.qty_tp2}")
-
-                send_telegram_message(
-                    f"💰 *TP1 HIT [{side.upper()}]*\n"
-                    f"Price: {tr.tp1_price:.2f} | qty: {tr.qty_tp1}\n"
-                    f"PnL≈: {pnl_tp1:.2f}\n"
-                    f"SL moved to breakeven {self.initial_entry_price:.2f}\n"
-                    f"TP2 target: {tr.tp2_price:.2f}")
-
-        # TP2
-        if tr.tp1_filled and not tr.tp2_filled:
-            tp2_hit = (current_price >= tr.tp2_price if side == "long"
-                       else current_price <= tr.tp2_price)
-            if tp2_hit:
-                tr.tp2_filled      = True
-                tr.tranche_index   = 2
-                pnl_tp2            = abs(tr.tp2_price -
-                                          self.initial_entry_price) * tr.qty_tp2
-                tr.realized_pnl_tp2 = pnl_tp2
-                tr.trail_active    = True
-                logger.info(
-                    f"💰 TP2 FILLED {side} @ {tr.tp2_price:.2f} "
-                    f"qty={tr.qty_tp2} pnl≈{pnl_tp2:.2f}")
-
-                send_telegram_message(
-                    f"💰 *TP2 HIT [{side.upper()}]*\n"
-                    f"Price: {tr.tp2_price:.2f} | qty: {tr.qty_tp2}\n"
-                    f"PnL≈: {pnl_tp2:.2f}\n"
-                    f"TP3 trail active for {tr.qty_tp3} remaining")
-
-    # =========================================================================
     # DYNAMIC STOP LOSS
     # =========================================================================
+
+    def _get_structure_trailing_stop(self, side: str) -> Optional[float]:
+        """
+        Derive trailing SL from recent market structure (swing points).
+        Long: highest recent confirmed lows under market.
+        Short: lowest recent confirmed highs above market.
+        """
+        tick = config.TICK_SIZE
+        pad = max(config.SL_BUFFER_TICKS, 1) * tick
+
+        if side == "long":
+            lows = [sw.price for sw in list(self.swing_lows)[-12:] if sw.confirmed]
+            if not lows:
+                return None
+            return max(lows) - pad
+
+        highs = [sw.price for sw in list(self.swing_highs)[-12:] if sw.confirmed]
+        if not highs:
+            return None
+        return min(highs) + pad
+
+    def _emergency_flatten_position(self, order_manager, reason: str) -> None:
+        """Fail-safe: flatten immediately if SL replacement fails."""
+        if not self.active_position:
+            return
+        side = self.active_position.get("side")
+        qty = self.active_position.get("quantity", 0)
+        if not side or qty <= 0:
+            return
+        exit_side = "SHORT" if side == "long" else "LONG"
+        try:
+            GlobalRateLimiter.wait()
+            order_manager.place_market_order(side=exit_side, quantity=qty)
+            logger.critical(f"🚨 Emergency flatten executed [{reason}] qty={qty}")
+            send_telegram_message(
+                f"🚨 *EMERGENCY FLATTEN*\n"
+                f"Reason: {reason}\n"
+                f"Side: {side.upper()} | Qty: {qty}")
+            self._reset_position_state()
+        except Exception as ex:
+            logger.critical(f"🚨 Emergency flatten FAILED: {ex}", exc_info=True)
 
     def _move_sl(self, new_sl: float, order_manager, reason: str):
         try:
@@ -3653,14 +3700,10 @@ class AdvancedICTStrategy:
             side      = self.active_position["side"]
             exit_side = "SHORT" if side == "long" else "LONG"
             qty_rem   = self.active_position.get("quantity", 0)
-            if self._tranche:
-                filled = (self._tranche.qty_tp1 if self._tranche.tp1_filled
-                          else 0)
-                filled += (self._tranche.qty_tp2 if self._tranche.tp2_filled
-                           else 0)
-                qty_rem = max(self.active_position.get("quantity", 0) - filled,
-                              self._tranche.qty_tp3)
+            if qty_rem <= 0:
+                return
 
+            prior_sl_id = self.sl_order_id
             if self.sl_order_id:
                 order_manager.cancel_order(self.sl_order_id)
             GlobalRateLimiter.wait()
@@ -3675,14 +3718,21 @@ class AdvancedICTStrategy:
                 logger.info(
                     f"🔄 SL moved [{reason}] → {new_sl_r:.2f} "
                     f"id={new_sl_id}")
+                return
+
+            logger.error(
+                f"❌ SL replace failed after cancel [{reason}] old_id={prior_sl_id} "
+                f"new_sl={new_sl_r:.2f} — triggering emergency flatten")
+            self._emergency_flatten_position(order_manager, f"SL_REPLACE_FAIL:{reason}")
         except Exception as e:
             logger.error(f"❌ Move SL error: {e}", exc_info=True)
+            self._emergency_flatten_position(order_manager, f"SL_REPLACE_EXCEPTION:{reason}")
 
     def _update_dynamic_stop_loss(self, current_price: float,
                                    order_manager, current_time: int):
         """
-        Breakeven, profit-lock, and ATR trailing SL.
-        After TP2 filled → trail remaining TP3 qty aggressively.
+        Breakeven, structure-following SL, and ATR profit protection.
+        Single-TP mode: SL is actively re-anchored to structure progression.
         """
         if not self.active_position or not self.initial_entry_price:
             return
@@ -3706,14 +3756,17 @@ class AdvancedICTStrategy:
                         self._move_sl(new_sl, order_manager, "BREAKEVEN")
                         self.breakeven_moved = True
 
-            # Trail: TP3 active — trail at 1.5× ATR below highest
-            if self._tranche and self._tranche.trail_active:
-                trail_sl = (self.highest_price_reached or current_price) - atr_sl
+            # Structure-led trailing + ATR floor
+            struct_sl = self._get_structure_trailing_stop("long")
+            atr_trail_sl = (self.highest_price_reached or current_price) - atr_sl
+            candidates = [x for x in [struct_sl, atr_trail_sl] if x is not None]
+            if candidates:
+                trail_sl = max(candidates)
                 trail_sl = round(trail_sl / tick) * tick
-                if trail_sl > current_sl:
-                    self._move_sl(trail_sl, order_manager, "ATR_TRAIL_TP3")
-            # Normal profit-lock progression
-            elif self.highest_price_reached:
+                if trail_sl > current_sl and trail_sl < current_price:
+                    self._move_sl(trail_sl, order_manager, "STRUCTURE_ATR_TRAIL")
+
+            if self.highest_price_reached:
                 profit_pct = ((self.highest_price_reached - entry)
                               / entry * 100)
                 if profit_pct >= 1.5 and self.profit_locked_pct < 0.5:
@@ -3738,12 +3791,16 @@ class AdvancedICTStrategy:
                         self._move_sl(new_sl, order_manager, "BREAKEVEN")
                         self.breakeven_moved = True
 
-            if self._tranche and self._tranche.trail_active:
-                trail_sl = (self.lowest_price_reached or current_price) + atr_sl
+            struct_sl = self._get_structure_trailing_stop("short")
+            atr_trail_sl = (self.lowest_price_reached or current_price) + atr_sl
+            candidates = [x for x in [struct_sl, atr_trail_sl] if x is not None]
+            if candidates:
+                trail_sl = min(candidates)
                 trail_sl = round(trail_sl / tick) * tick
-                if trail_sl < current_sl:
-                    self._move_sl(trail_sl, order_manager, "ATR_TRAIL_TP3")
-            elif self.lowest_price_reached:
+                if trail_sl < current_sl and trail_sl > current_price:
+                    self._move_sl(trail_sl, order_manager, "STRUCTURE_ATR_TRAIL")
+
+            if self.lowest_price_reached:
                 profit_pct = ((entry - self.lowest_price_reached)
                               / entry * 100)
                 if profit_pct >= 1.5 and self.profit_locked_pct < 0.5:
@@ -3773,34 +3830,21 @@ class AdvancedICTStrategy:
         else:
             return (self.initial_entry_price - close_price) * qty
 
-    def _close_position(self, order_manager, close_price: float,
+    def _close_position(self, order_manager, risk_manager, close_price: float,
                          reason: str, pnl: float, current_time: int):
         try:
+            self._sm_transition("EXITING", reason)
             side = self.active_position["side"] if self.active_position else "?"
             logger.info(
                 f"📤 CLOSE [{side.upper()}] reason={reason} "
                 f"price={close_price:.2f} pnl={pnl:.4f}")
 
-            # Cancel open orders
-            for oid in filter(None, [
-                self.sl_order_id, self.tp_order_id,
-                (self._tranche.tp2_order_id
-                 if self._tranche and not self._tranche.tp2_filled else None),
-            ]):
-                try:
-                    order_manager.cancel_order(oid)
-                except Exception:
-                    pass
+            # Cancel exit orders atomically (TP first then SL)
+            order_manager.cancel_all_exit_orders(self.sl_order_id, self.tp_order_id)
 
             # Market close remainder
             if self.active_position:
                 qty_rem = self.active_position.get("quantity", 0)
-                if self._tranche:
-                    filled = ((self._tranche.qty_tp1 if self._tranche.tp1_filled
-                               else 0)
-                              + (self._tranche.qty_tp2 if self._tranche.tp2_filled
-                                 else 0))
-                    qty_rem = max(qty_rem - filled, 0)
                 if qty_rem > 0:
                     exit_side = ("SHORT" if side == "long" else "LONG")
                     GlobalRateLimiter.wait()
@@ -3833,9 +3877,7 @@ class AdvancedICTStrategy:
 
             total  = self.total_exits
             wr     = self.winning_trades / total * 100 if total > 0 else 0
-            tr_pnl = (self._tranche.realized_pnl_tp1 +
-                      self._tranche.realized_pnl_tp2) \
-                     if self._tranche else 0.0
+            tr_pnl = 0.0
 
             send_telegram_message(
                 f"📤 *POSITION CLOSED [{side.upper()}]*\n"
@@ -3863,11 +3905,12 @@ class AdvancedICTStrategy:
 
     def _reset_position_state(self):
         self.state                 = "READY"
+        self._sm_transition("COOLDOWN", "position_reset")
+        self._sm_transition("SCANNING", "cooldown_complete")
         self.active_position       = None
         self.entry_order_id        = None
         self.sl_order_id           = None
         self.tp_order_id           = None
-        self._tranche              = None
         self.initial_entry_price   = None
         self.initial_sl_price      = None
         self.initial_tp_price      = None
@@ -3901,6 +3944,7 @@ class AdvancedICTStrategy:
         self.highest_price_reached = entry_price
         self.lowest_price_reached  = entry_price
         self.state                 = "POSITION_ACTIVE"
+        self._sm_transition("POSITION_ACTIVE", "orphan_adopted")
         logger.info(
             f"🔁 Adopted orphaned {side} @ {entry_price:.2f} "
             f"SL={sl_price:.2f} TP={tp_price:.2f}")
@@ -3988,9 +4032,5 @@ class AdvancedICTStrategy:
             # Self-adaptation
             "capital_preserve":     self._capital_preserve_mode,
             "regime_stats":         regime_stats,
-            # Tranche
-            "tranche_index":        self._tranche.tranche_index
-                                    if self._tranche else 0,
-            "trail_active":         self._tranche.trail_active
-                                    if self._tranche else False,
+            "tp_mode":              "single_tp_dynamic_sl",
         }

@@ -167,21 +167,21 @@ class StateMachine:
 
 class TradingStateMachine(StateMachine):
     """Pre-configured state machine for trading bot"""
-    
+
     def __init__(self):
         valid_transitions = {
-            "INITIALIZING": {"READY", "ERROR"},
-            "READY": {"SCANNING", "ERROR"},
-            "SCANNING": {"ENTRY_PENDING", "READY", "ERROR"},
-            "ENTRY_PENDING": {"POSITION_ACTIVE", "READY", "ERROR"},
+            "IDLE": {"SCANNING", "ERROR"},
+            "SCANNING": {"ENTRY_PENDING", "IDLE", "ERROR"},
+            "ENTRY_PENDING": {"POSITION_ACTIVE", "SCANNING", "ERROR"},
             "POSITION_ACTIVE": {"EXITING", "ERROR"},
-            "EXITING": {"READY", "ERROR"},
-            "ERROR": {"READY", "INITIALIZING"},
+            "EXITING": {"COOLDOWN", "SCANNING", "ERROR"},
+            "COOLDOWN": {"SCANNING", "IDLE", "ERROR"},
+            "ERROR": {"IDLE", "SCANNING"},
         }
-        
+
         super().__init__(
             name="TRADING",
-            initial_state="INITIALIZING",
+            initial_state="IDLE",
             valid_transitions=valid_transitions
         )
 
