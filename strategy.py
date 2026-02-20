@@ -650,6 +650,8 @@ class AdvancedICTStrategy:
         # ── Timing ────────────────────────────────────────────────────────────
         self._last_structure_update_ms   = 0
         self._last_entry_eval_ms         = 0
+        self._last_gate_reject_key: Optional[str] = None
+        self._last_gate_reject_ms:  int = 0
         self._last_sl_hit_time           = 0
         self._placement_locked_until     = 0
         self.last_sl_update              = 0
@@ -1420,17 +1422,18 @@ class AdvancedICTStrategy:
                     100)
 
                 # Check inducement: was there a sweep just before this OB?
+                cur_ts_ms = self._ts_ms(cur)
                 inducement = any(
                     lp.swept and lp.pool_type == "EQL"
                     and abs(lp.price - cur_l) / current_price * 100 < 0.5
-                    and lp.sweep_timestamp < cur['t']
+                    and lp.sweep_timestamp < cur_ts_ms
                     for lp in self.liquidity_pools)
 
                 if not any(abs(ob.low - cur_l) <= tol and
                            abs(ob.high - cur_h) <= tol
                            for ob in self.order_blocks_bull):
                     self.order_blocks_bull.append(OrderBlock(
-                        low=cur_l, high=cur_h, timestamp=cur['t'],
+                        low=cur_l, high=cur_h, timestamp=cur_ts_ms,
                         has_wick_rejection=wick_rej, strength=strength,
                         direction="bullish", has_displacement=has_disp,
                         inducement_near=inducement, bos_confirmed=bos_ok,
@@ -1449,17 +1452,18 @@ class AdvancedICTStrategy:
                     (10 if wick_rej else 0),
                     100)
 
+                cur_ts_ms = self._ts_ms(cur)
                 inducement = any(
                     lp.swept and lp.pool_type == "EQH"
                     and abs(lp.price - cur_h) / current_price * 100 < 0.5
-                    and lp.sweep_timestamp < cur['t']
+                    and lp.sweep_timestamp < cur_ts_ms
                     for lp in self.liquidity_pools)
 
                 if not any(abs(ob.low - cur_l) <= tol and
                            abs(ob.high - cur_h) <= tol
                            for ob in self.order_blocks_bear):
                     self.order_blocks_bear.append(OrderBlock(
-                        low=cur_l, high=cur_h, timestamp=cur['t'],
+                        low=cur_l, high=cur_h, timestamp=cur_ts_ms,
                         has_wick_rejection=wick_rej, strength=strength,
                         direction="bearish", has_displacement=has_disp,
                         inducement_near=inducement, bos_confirmed=bos_ok,
@@ -1491,7 +1495,7 @@ class AdvancedICTStrategy:
                                for f in self.fvgs_bull):
                         self.fvgs_bull.append(FairValueGap(
                             bottom=c1_h, top=c3_l,
-                            timestamp=candles[i]['t'],
+                            timestamp=self._ts_ms(candles[i]),
                             direction="bullish"))
 
             # Bearish FVG: c1 low > c3 high
@@ -1503,7 +1507,7 @@ class AdvancedICTStrategy:
                                for f in self.fvgs_bear):
                         self.fvgs_bear.append(FairValueGap(
                             bottom=c3_h, top=c1_l,
-                            timestamp=candles[i]['t'],
+                            timestamp=self._ts_ms(candles[i]),
                             direction="bearish"))
 
     def _update_fvg_fills(self, candles: List[Dict]):
@@ -2872,6 +2876,18 @@ class AdvancedICTStrategy:
 
         return len(met), met
 
+    def _log_gate_reject(self, level: str, side: str,
+                         detail: str, current_time: int) -> None:
+        """Debounced gate-rejection logging to avoid repeated spam."""
+        throttle_ms = 20_000
+        key = f"{level}:{side}:{detail}"
+        if (key == self._last_gate_reject_key
+                and (current_time - self._last_gate_reject_ms) < throttle_ms):
+            return
+        self._last_gate_reject_key = key
+        self._last_gate_reject_ms = current_time
+        logger.info(f"❌ {level} [{side}]: {detail}")
+
     # =========================================================================
     # ENTRY EVALUATION — FULL CASCADE
     # =========================================================================
@@ -2994,25 +3010,29 @@ class AdvancedICTStrategy:
                 l1_ok, l1_reason = self._cascade_l1_pass(
                     side, current_price, current_time)
                 if not l1_ok:
-                    logger.info(f"❌ L1 [{side}]: {l1_reason}")
+                    self._log_gate_reject("L1", side, l1_reason, current_time)
                     continue
 
                 # L2 gate
                 l2_count, l2_met = self._cascade_l2_triggers(
                     side, current_price, s_ctx, current_time)
                 if l2_count < CASCADE_L2_MIN_TRIGGERS:
-                    logger.info(
-                        f"❌ L2 [{side}]: {l2_count}/{CASCADE_L2_MIN_TRIGGERS} "
-                        f"triggers {l2_met}")
+                    self._log_gate_reject(
+                        "L2", side,
+                        f"{l2_count}/{CASCADE_L2_MIN_TRIGGERS} triggers {l2_met}",
+                        current_time,
+                    )
                     continue
 
                 # L3 gate
                 l3_count, l3_met = self._cascade_l3_confirmations(
                     side, current_price, s_ctx, s_score, score_bonus)
                 if l3_count < CASCADE_L3_MIN_CONFIRMS:
-                    logger.info(
-                        f"❌ L3 [{side}]: {l3_count}/{CASCADE_L3_MIN_CONFIRMS} "
-                        f"confirms {l3_met}")
+                    self._log_gate_reject(
+                        "L3", side,
+                        f"{l3_count}/{CASCADE_L3_MIN_CONFIRMS} confirms {l3_met}",
+                        current_time,
+                    )
                     continue
 
                 logger.info(
