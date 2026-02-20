@@ -127,6 +127,9 @@ class ICTDataManager:
         # Indicator cache
         self._ema_cache: Dict[str, float] = {}
 
+        # Per-timeframe dedup for closed candle events
+        self._last_closed_candle_ts: Dict[str, int] = {}
+
         # Readiness
         self._strategy_ref = None   # set via register_strategy()
         self.is_ready: bool = False
@@ -714,11 +717,22 @@ class ICTDataManager:
                 self._last_price = candle.close          # ← FIXED
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_1m:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("1m") == candle_ts_ms:
+                    return
+
+                if not self._candles_1m:
                     self._candles_1m.append(candle)
-                    logger.info(f"✅ 1m CLOSED @ ${candle.close:.2f} ({len(self._candles_1m)})")
-                else:
+                elif candle.timestamp > self._candles_1m[-1].timestamp:
+                    self._candles_1m.append(candle)
+                elif candle.timestamp == self._candles_1m[-1].timestamp:
                     self._candles_1m[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["1m"] = candle_ts_ms
+                    logger.info(f"✅ 1m CLOSED @ ${candle.close:.2f} ({len(self._candles_1m)})")
 
                 self.stats.record_candle()
                 if is_closed:
@@ -746,11 +760,22 @@ class ICTDataManager:
                 self._last_price = candle.close          # ← FIXED
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_5m:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("5m") == candle_ts_ms:
+                    return
+
+                if not self._candles_5m:
                     self._candles_5m.append(candle)
-                    logger.info(f"✅ 5m CLOSED @ ${candle.close:.2f} ({len(self._candles_5m)})")
-                else:
+                elif candle.timestamp > self._candles_5m[-1].timestamp:
+                    self._candles_5m.append(candle)
+                elif candle.timestamp == self._candles_5m[-1].timestamp:
                     self._candles_5m[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["5m"] = candle_ts_ms
+                    logger.info(f"✅ 5m CLOSED @ ${candle.close:.2f} ({len(self._candles_5m)})")
 
                 self.stats.record_candle()
                 if is_closed:
@@ -778,11 +803,22 @@ class ICTDataManager:
                 self._last_price = candle.close          # ← FIXED
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_15m:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("15m") == candle_ts_ms:
+                    return
+
+                if not self._candles_15m:
                     self._candles_15m.append(candle)
-                    logger.info(f"✅ 15m CLOSED @ ${candle.close:.2f} ({len(self._candles_15m)})")
-                else:
+                elif candle.timestamp > self._candles_15m[-1].timestamp:
+                    self._candles_15m.append(candle)
+                elif candle.timestamp == self._candles_15m[-1].timestamp:
                     self._candles_15m[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["15m"] = candle_ts_ms
+                    logger.info(f"✅ 15m CLOSED @ ${candle.close:.2f} ({len(self._candles_15m)})")
 
                 self.stats.record_candle()
                 if is_closed:
@@ -809,11 +845,22 @@ class ICTDataManager:
                 self._last_price = candle.close
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_1h:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("1h") == candle_ts_ms:
+                    return
+
+                if not self._candles_1h:
                     self._candles_1h.append(candle)
-                    logger.info(f"✅ 1h CLOSED @ ${candle.close:.2f} ({len(self._candles_1h)})")
-                else:
+                elif candle.timestamp > self._candles_1h[-1].timestamp:
+                    self._candles_1h.append(candle)
+                elif candle.timestamp == self._candles_1h[-1].timestamp:
                     self._candles_1h[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["1h"] = candle_ts_ms
+                    logger.info(f"✅ 1h CLOSED @ ${candle.close:.2f} ({len(self._candles_1h)})")
 
                 self.stats.record_candle()
                 if is_closed:
@@ -841,11 +888,22 @@ class ICTDataManager:
                 self._last_price = candle.close          # ← FIXED
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_4h:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("4h") == candle_ts_ms:
+                    return
+
+                if not self._candles_4h:
                     self._candles_4h.append(candle)
-                    logger.info(f"✅ 4h CLOSED @ ${candle.close:.2f} ({len(self._candles_4h)})")
-                else:
+                elif candle.timestamp > self._candles_4h[-1].timestamp:
+                    self._candles_4h.append(candle)
+                elif candle.timestamp == self._candles_4h[-1].timestamp:
                     self._candles_4h[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["4h"] = candle_ts_ms
+                    logger.info(f"✅ 4h CLOSED @ ${candle.close:.2f} ({len(self._candles_4h)})")
 
                 self.stats.record_candle()
                 if is_closed:
@@ -872,11 +930,22 @@ class ICTDataManager:
                 self._last_price = candle.close
                 is_closed = data.get('x', False)
 
-                if is_closed or not self._candles_1d:
+                candle_ts_ms = int(float(data.get('t', 0)))
+                if is_closed and self._last_closed_candle_ts.get("1d") == candle_ts_ms:
+                    return
+
+                if not self._candles_1d:
                     self._candles_1d.append(candle)
-                    logger.info(f"✅ 1d CLOSED @ ${candle.close:.2f} ({len(self._candles_1d)})")
-                else:
+                elif candle.timestamp > self._candles_1d[-1].timestamp:
+                    self._candles_1d.append(candle)
+                elif candle.timestamp == self._candles_1d[-1].timestamp:
                     self._candles_1d[-1] = candle
+                else:
+                    return
+
+                if is_closed:
+                    self._last_closed_candle_ts["1d"] = candle_ts_ms
+                    logger.info(f"✅ 1d CLOSED @ ${candle.close:.2f} ({len(self._candles_1d)})")
 
                 self.stats.record_candle()
                 if is_closed:
