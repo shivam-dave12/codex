@@ -1198,6 +1198,34 @@ class AdvancedICTStrategy:
 
         return structural_dir, strength, components
 
+    def _calculate_micro_bias_score(self, current_time: int) -> float:
+        """Micro-bias strength score (0-100) for neutral-HTF threshold override."""
+        try:
+            bias, strength, components = self._resolve_directional_bias(current_time)
+            if bias == "NEUTRAL":
+                return 0.0
+
+            score = max(0.0, min(100.0, strength * 100.0))
+
+            # Require structure + at least one supporting component for high confidence.
+            has_mss = abs(float(components.get("mss", 0.0))) > 0
+            supporters = 0
+            if abs(float(components.get("daily", 0.0))) > 0:
+                supporters += 1
+            if abs(float(components.get("cvd", 0.0))) > 0:
+                supporters += 1
+
+            if not has_mss:
+                return 0.0
+            if supporters == 0:
+                score *= 0.7
+
+            return score
+        except Exception:
+            return 0.0
+
+        return structural_dir, strength, components
+
     # =========================================================================
     # NESTED DEALING RANGES  (3-tier IPDA)
     # =========================================================================
@@ -2983,6 +3011,19 @@ class AdvancedICTStrategy:
                                  if hasattr(data_manager, "get_candles") else None
             tce_state          = self._tce_update(
                 current_price, current_time, candles_5m=candles_5m)
+
+            # Anti-deadlock: stale AWAITING_CONFIRMATION must not block forever.
+            if (self._active_tce is not None and
+                    self._active_tce.tce_state == "AWAITING_CONFIRMATION"):
+                age_min = ((current_time - self._active_tce.bias_change_time)
+                           / 60_000)
+                if age_min > 15:
+                    logger.info(
+                        "TCE auto-expired after 15 min — resuming normal scanning")
+                    self._active_tce.expired_reason = "Auto-expired after stale confirmation"
+                    self._active_tce.expire_time = current_time
+                    self._active_tce.tce_state = "EXPIRED"
+
             score_bonus, gate_desc = self._tce_get_entry_modifier()
 
             # ── TCE hard gate with expansion bypass ───────────────────────
@@ -3053,13 +3094,20 @@ class AdvancedICTStrategy:
                 base_threshold = config.ENTRY_THRESHOLD_KILLZONE
             else:
                 base_threshold = config.ENTRY_THRESHOLD_REGULAR
+
+            # Ranging regime requires lower threshold to avoid permanent no-trade lock.
+            if rs.regime == REGIME_RANGING:
+                base_threshold = min(base_threshold, 72)
+
             threshold  = (base_threshold * rs.entry_threshold_modifier
                           + self._get_adaptive_threshold_add())
 
-            # Neutral HTF mode is tradable, but requires tighter execution.
+            # Neutral HTF mode uses micro-bias override instead of blanket penalty.
             neutral_trade_mode = (self.htf_bias == "NEUTRAL")
             if neutral_trade_mode:
-                threshold += 5.0
+                micro_score = self._calculate_micro_bias_score(current_time)
+                if micro_score >= 65:
+                    threshold = min(threshold, 70.0)
 
             # ── Near-miss reporting ───────────────────────────────────────
             if (long_score >= 75 or short_score >= 75) and \
