@@ -1194,6 +1194,10 @@ class AdvancedICTStrategy:
             supporters += 1
 
         min_supporters = 0 if strict_agreement else 1
+        min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
+        if supporters < min_supporters or edge < min_edge:
+            return "NEUTRAL", strength, components
+
 
         min_supporters = 1 if strict_agreement else 2
         min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
@@ -2922,18 +2926,18 @@ class AdvancedICTStrategy:
         """
         met: List[str] = []
 
-        # A. Sweep + displacement
+        # A. Sweep evidence
         if ctx.sweep_detected:
             sw_pool = next(
                 (lp for lp in reversed(list(self.liquidity_pools))
-                 if lp.swept and lp.displacement_confirmed
+                 if lp.swept
                  and (current_time - lp.sweep_timestamp)
                  <= getattr(config, "SWEEP_MAX_AGE_MINUTES", 120) * 60_000
                  and ((side == "long"  and lp.pool_type == "EQL") or
                       (side == "short" and lp.pool_type == "EQH"))),
                 None)
             if sw_pool:
-                met.append("SWEEP_DISP")
+                met.append("SWEEP_DISP" if sw_pool.displacement_confirmed else "SWEEP_WICK")
 
         # B. OB or FVG touch
         if ctx.trigger_ob is not None and \
@@ -3143,11 +3147,9 @@ class AdvancedICTStrategy:
                 ("long",  long_score,  long_reasons,  long_ctx),
                 ("short", short_score, short_reasons, short_ctx),
             ]:
-                if s_score < threshold:
-                    continue
-                # opposite side must not outscore
-                other = short_score if side == "long" else long_score
-                if other >= s_score:
+                # Score is observability; cascade gates are the execution authority.
+                # Keep an ultra-low sanity floor to avoid pathological noise execution.
+                if s_score < 35:
                     continue
 
                 # L1 gate
