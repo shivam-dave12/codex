@@ -1183,6 +1183,8 @@ class AdvancedICTStrategy:
         edge = abs(bull - bear)
         strength = min(max(max(bull, bear), 0.0), 1.0)
 
+        # Firmness gate: when 5m+15m agree, structure itself is sufficient;
+        # when only one timeframe structure is available, require at least one supporter.
         # Firmness gate: when 5m+15m agree -> require 1 supporter;
         # when only one timeframe structure is available -> require 2 supporters.
         supporters = 0
@@ -1190,6 +1192,8 @@ class AdvancedICTStrategy:
             supporters += 1
         if cvd_dir == structural_dir:
             supporters += 1
+
+        min_supporters = 0 if strict_agreement else 1
 
         min_supporters = 1 if strict_agreement else 2
         min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
@@ -3114,6 +3118,8 @@ class AdvancedICTStrategy:
             # Ranging regime requires lower threshold to avoid permanent no-trade lock.
             if rs.regime == REGIME_RANGING:
                 base_threshold = min(base_threshold, 72)
+            elif rs.regime in (REGIME_ACCUMULATION, REGIME_DISTRIBUTION):
+                base_threshold = min(base_threshold, 64)
 
             threshold  = (base_threshold * rs.entry_threshold_modifier
                           + self._get_adaptive_threshold_add())
