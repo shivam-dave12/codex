@@ -1125,6 +1125,7 @@ class AdvancedICTStrategy:
 
         # 2) Firm STF structure confirmation with anti-stall policy:
         #    Prefer 5m+15m agreement; if 15m not available, allow strong 5m with extra support.
+        # 2) Firm STF structure confirmation: latest 5m and 15m BOS/CHoCH must agree
         last_5m = next(
             (ms for ms in reversed(list(self.market_structures))
              if ms.timeframe == "5m"
@@ -1222,6 +1223,8 @@ class AdvancedICTStrategy:
             return score
         except Exception:
             return 0.0
+
+        return structural_dir, strength, components
 
     # =========================================================================
     # NESTED DEALING RANGES  (3-tier IPDA)
@@ -3841,6 +3844,14 @@ class AdvancedICTStrategy:
 
             # Cancel exit orders atomically (TP first then SL)
             order_manager.cancel_all_exit_orders(self.sl_order_id, self.tp_order_id)
+            # Cancel open orders
+            for oid in filter(None, [
+                self.sl_order_id, self.tp_order_id,
+            ]):
+                try:
+                    order_manager.cancel_order(oid)
+                except Exception:
+                    pass
 
             # Market close remainder
             if self.active_position:
