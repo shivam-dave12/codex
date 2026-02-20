@@ -1198,6 +1198,14 @@ class AdvancedICTStrategy:
 
         return structural_dir, strength, components
 
+
+        min_supporters = 1 if strict_agreement else 2
+        min_edge = MICRO_BIAS_MIN_EDGE if strict_agreement else (MICRO_BIAS_MIN_EDGE + 0.05)
+        if supporters < min_supporters or edge < min_edge:
+            return "NEUTRAL", strength, components
+
+        return structural_dir, strength, components
+
     def _calculate_micro_bias_score(self, current_time: int) -> float:
         """Micro-bias strength score (0-100) for neutral-HTF threshold override."""
         try:
@@ -1845,12 +1853,18 @@ class AdvancedICTStrategy:
     def _tce_on_bias_change(self, new_bias: str, ts_now: int,
                              from_neutral: bool = False,
                              price_at_flip: float = 0.0):
-        """Opens a new TrendChangeRecord on every HTF bias flip."""
+        """Opens a new TrendChangeRecord on directional HTF bias flips only."""
         if self._active_tce and self._active_tce.tce_state != "EXPIRED":
             self._active_tce.tce_state      = "EXPIRED"
             self._active_tce.expired_reason = "Superseded by new bias flip"
             self._active_tce.expire_time    = ts_now
             logger.info("🔄 Previous TCE cycle superseded")
+
+        # Neutral HTF is not a directional trend-change cycle.
+        if new_bias == "NEUTRAL":
+            self._active_tce = None
+            logger.info("ℹ️ HTF moved to NEUTRAL — no TCE cycle opened")
+            return
 
         self._active_tce = TrendChangeRecord(
             bias_direction=new_bias,
@@ -2069,6 +2083,8 @@ class AdvancedICTStrategy:
         AWAITING_*             → -999 hard gate
         """
         if self._active_tce is None or self._active_tce.tce_state == "EXPIRED":
+            return 0.0, "STEADY_STATE"
+        if self._active_tce.bias_direction == "NEUTRAL":
             return 0.0, "STEADY_STATE"
         state = self._active_tce.tce_state
         if state == "PULLBACK_REACHED":
