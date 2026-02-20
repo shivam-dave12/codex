@@ -885,6 +885,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["1h"] = candle_ts_ms
                     logger.info(f"✅ 1h CLOSED @ ${candle.close:.2f} ({len(self._candles_1h)})")
+                    self._emit_closed_candle("1h", candle)
 
                 self.stats.record_candle()
                 if is_closed:
@@ -928,6 +929,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["4h"] = candle_ts_ms
                     logger.info(f"✅ 4h CLOSED @ ${candle.close:.2f} ({len(self._candles_4h)})")
+                    self._emit_closed_candle("4h", candle)
 
                 self.stats.record_candle()
                 if is_closed:
@@ -970,6 +972,7 @@ class ICTDataManager:
                 if is_closed:
                     self._last_closed_candle_ts["1d"] = candle_ts_ms
                     logger.info(f"✅ 1d CLOSED @ ${candle.close:.2f} ({len(self._candles_1d)})")
+                    self._emit_closed_candle("1d", candle)
 
                 self.stats.record_candle()
                 if is_closed:

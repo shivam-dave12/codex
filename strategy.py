@@ -655,6 +655,8 @@ class AdvancedICTStrategy:
         self._last_gate_reject_key: Optional[str] = None
         self._last_gate_reject_ms:  int = 0
         self._last_regime_bos_ts:   int = 0
+        self._latest_closed_5m_ts:  int = 0
+        self._last_processed_5m_ts: int = 0
         self._last_sl_hit_time           = 0
         self._placement_locked_until     = 0
         self.last_sl_update              = 0
@@ -705,6 +707,14 @@ class AdvancedICTStrategy:
     def on_tick(self, data_manager, order_manager, risk_manager,
                 current_time: int) -> None:
         try:
+            # Backward-compatible runtime guards (handles hot-reload/old objects)
+            if not hasattr(self, "_latest_closed_5m_ts"):
+                self._latest_closed_5m_ts = 0
+            if not hasattr(self, "_last_processed_5m_ts"):
+                self._last_processed_5m_ts = 0
+            if not hasattr(self, "_state_machine"):
+                self._state_machine = TradingStateMachine()
+
             # Store risk_manager ref (used in _close_position)
             if self._risk_manager is None:
                 self._risk_manager = risk_manager
@@ -3784,6 +3794,8 @@ class AdvancedICTStrategy:
                 f"📤 CLOSE [{side.upper()}] reason={reason} "
                 f"price={close_price:.2f} pnl={pnl:.4f}")
 
+            # Cancel exit orders atomically (TP first then SL)
+            order_manager.cancel_all_exit_orders(self.sl_order_id, self.tp_order_id)
             # Cancel open orders
             for oid in filter(None, [
                 self.sl_order_id, self.tp_order_id,
