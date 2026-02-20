@@ -904,19 +904,16 @@ class OrderManager:
         tp_result = CancelResult.NOT_FOUND
         sl_result = CancelResult.NOT_FOUND
 
-        if tp_order_id:
-            logger.info(f"Cancelling TP: {tp_order_id}")
-            tp_result = self.cancel_order(tp_order_id)
-            logger.info(f"TP cancel result: {tp_result.value}")
+        with self._orders_lock:
+            if tp_order_id:
+                logger.info(f"Cancelling TP: {tp_order_id}")
+                tp_result = self.cancel_order(tp_order_id)
+                logger.info(f"TP cancel result: {tp_result.value}")
 
-            # If TP fired, position may already be closed — check SL
-            if tp_result == CancelResult.ALREADY_FILLED:
-                logger.info(f"TP already filled — cancelling SL defensively")
-
-        if sl_order_id:
-            logger.info(f"Cancelling SL: {sl_order_id}")
-            sl_result = self.cancel_order(sl_order_id)
-            logger.info(f"SL cancel result: {sl_result.value}")
+            if sl_order_id:
+                logger.info(f"Cancelling SL: {sl_order_id}")
+                sl_result = self.cancel_order(sl_order_id)
+                logger.info(f"SL cancel result: {sl_result.value}")
 
         return sl_result, tp_result
 
