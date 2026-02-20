@@ -1056,7 +1056,7 @@ class AdvancedICTStrategy:
         """
         Returns execution bias used by entry engine.
         - If HTF bias is directional, it is authoritative.
-        - If HTF is neutral, derive direction from small-timeframe structure.
+        - If HTF is neutral, require firm STF structure confirmation.
         """
         if self.htf_bias in ("BULLISH", "BEARISH"):
             return self.htf_bias, self.htf_bias_strength, {"htf": self.htf_bias_strength}
@@ -1065,36 +1065,47 @@ class AdvancedICTStrategy:
         bear = 0.0
         components: Dict[str, float] = {}
 
-        # 1) 5m directional bias proxy
+        # 1) Daily directional context (supportive, not decisive)
+        daily_dir = "NEUTRAL"
         if self.daily_bias == "BULLISH":
             bull += MICRO_BIAS_DAILY_WEIGHT
             components["daily"] = MICRO_BIAS_DAILY_WEIGHT
+            daily_dir = "BULLISH"
         elif self.daily_bias == "BEARISH":
             bear += MICRO_BIAS_DAILY_WEIGHT
             components["daily"] = -MICRO_BIAS_DAILY_WEIGHT
+            daily_dir = "BEARISH"
 
-        # 2) Most recent 5m/15m MSS with age-decayed confidence
-        recent_mss = [
-            ms for ms in reversed(list(self.market_structures))
-            if ms.timeframe in ("5m", "15m")
-            and ms.structure_type in ("BOS", "CHoCH")
-            and (current_time - ms.timestamp) <= MICRO_BIAS_MSS_WINDOW_MS
-        ]
-        mss_weight_used = 0.0
-        for ms in recent_mss[:3]:
-            age_f = max(0.0, 1.0 - (current_time - ms.timestamp) / MICRO_BIAS_MSS_WINDOW_MS)
-            add_w = min(0.20 * age_f, MICRO_BIAS_MSS_MAX_WEIGHT - mss_weight_used)
-            if add_w <= 0:
-                break
-            if ms.direction == "bullish":
-                bull += add_w
-            elif ms.direction == "bearish":
-                bear += add_w
-            mss_weight_used += add_w
-        if mss_weight_used > 0:
-            components["mss"] = mss_weight_used if bull >= bear else -mss_weight_used
+        # 2) Firm STF structure confirmation: latest 5m and 15m BOS/CHoCH must agree
+        last_5m = next(
+            (ms for ms in reversed(list(self.market_structures))
+             if ms.timeframe == "5m"
+             and ms.structure_type in ("BOS", "CHoCH")
+             and (current_time - ms.timestamp) <= MICRO_BIAS_MSS_WINDOW_MS),
+            None,
+        )
+        last_15m = next(
+            (ms for ms in reversed(list(self.market_structures))
+             if ms.timeframe == "15m"
+             and ms.structure_type in ("BOS", "CHoCH")
+             and (current_time - ms.timestamp) <= (MICRO_BIAS_MSS_WINDOW_MS * 2)),
+            None,
+        )
 
-        # 3) CVD alignment confirmation
+        if not last_5m or not last_15m or last_5m.direction != last_15m.direction:
+            return "NEUTRAL", 0.0, components
+
+        structural_dir = "BULLISH" if last_5m.direction == "bullish" else "BEARISH"
+        structural_weight = MICRO_BIAS_MSS_MAX_WEIGHT
+        if structural_dir == "BULLISH":
+            bull += structural_weight
+            components["mss"] = structural_weight
+        else:
+            bear += structural_weight
+            components["mss"] = -structural_weight
+
+        # 3) CVD momentum confirmation (supportive)
+        cvd_dir = "NEUTRAL"
         if self.volume_analyzer and len(self.volume_analyzer.cvd_history) >= 10:
             cvd_sig = self.volume_analyzer.get_cvd_signal(lookback=80)
             signal = cvd_sig.get("signal", "NEUTRAL")
@@ -1102,29 +1113,26 @@ class AdvancedICTStrategy:
                 w = MICRO_BIAS_CVD_WEIGHT if signal == "BULL" else MICRO_BIAS_CVD_WEIGHT * 1.2
                 bull += w
                 components["cvd"] = w
+                cvd_dir = "BULLISH"
             elif "BEAR" in signal:
                 w = MICRO_BIAS_CVD_WEIGHT if signal == "BEAR" else MICRO_BIAS_CVD_WEIGHT * 1.2
                 bear += w
                 components["cvd"] = -w
+                cvd_dir = "BEARISH"
 
         edge = abs(bull - bear)
         strength = min(max(max(bull, bear), 0.0), 1.0)
 
-        if edge < MICRO_BIAS_MIN_EDGE:
-            # Tie-breaker uses freshest small-timeframe structure only.
-            freshest = next(
-                (ms for ms in reversed(list(self.market_structures))
-                 if ms.timeframe in ("5m", "15m")
-                 and ms.structure_type in ("BOS", "CHoCH")),
-                None,
-            )
-            if freshest is None:
-                return "NEUTRAL", strength, components
-            return ("BULLISH" if freshest.direction == "bullish" else "BEARISH",
-                    strength,
-                    components)
+        # Firmness gate: structure must be supported by at least one additional signal.
+        supporters = 0
+        if daily_dir == structural_dir:
+            supporters += 1
+        if cvd_dir == structural_dir:
+            supporters += 1
+        if supporters < 1 or edge < MICRO_BIAS_MIN_EDGE:
+            return "NEUTRAL", strength, components
 
-        return ("BULLISH", strength, components) if bull > bear else ("BEARISH", strength, components)
+        return structural_dir, strength, components
 
     # =========================================================================
     # NESTED DEALING RANGES  (3-tier IPDA)
