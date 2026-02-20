@@ -102,6 +102,14 @@ DR_ONE_ALIGNED_MULT       = 0.50
 DR_TP1_ZONE_PCT           = 0.50   # equilibrium of current DR
 DR_TP2_ZONE_PCT           = 0.79   # OTE edge of opposing DR
 
+# Neutral HTF handling (micro-bias execution profile)
+MICRO_BIAS_MSS_WINDOW_MS  = 45 * 60_000
+MICRO_BIAS_MSS_MAX_WEIGHT = 0.35
+MICRO_BIAS_DAILY_WEIGHT   = 0.45
+MICRO_BIAS_CVD_WEIGHT     = 0.20
+MICRO_BIAS_MIN_EDGE       = 0.10
+NEUTRAL_SL_MAX_PCT        = 0.010
+
 # ============================================================================
 # DATA STRUCTURES
 # ============================================================================
@@ -1071,6 +1079,80 @@ class AdvancedICTStrategy:
                 self.daily_bias = "NEUTRAL"
         except Exception as e:
             logger.error(f"❌ _update_daily_bias: {e}", exc_info=True)
+
+    def _resolve_directional_bias(self, current_time: int) -> Tuple[str, float, Dict[str, float]]:
+        """
+        Returns execution bias used by entry engine.
+        - If HTF bias is directional, it is authoritative.
+        - If HTF is neutral, derive direction from small-timeframe structure.
+        """
+        if self.htf_bias in ("BULLISH", "BEARISH"):
+            return self.htf_bias, self.htf_bias_strength, {"htf": self.htf_bias_strength}
+
+        bull = 0.0
+        bear = 0.0
+        components: Dict[str, float] = {}
+
+        # 1) 5m directional bias proxy
+        if self.daily_bias == "BULLISH":
+            bull += MICRO_BIAS_DAILY_WEIGHT
+            components["daily"] = MICRO_BIAS_DAILY_WEIGHT
+        elif self.daily_bias == "BEARISH":
+            bear += MICRO_BIAS_DAILY_WEIGHT
+            components["daily"] = -MICRO_BIAS_DAILY_WEIGHT
+
+        # 2) Most recent 5m/15m MSS with age-decayed confidence
+        recent_mss = [
+            ms for ms in reversed(list(self.market_structures))
+            if ms.timeframe in ("5m", "15m")
+            and ms.structure_type in ("BOS", "CHoCH")
+            and (current_time - ms.timestamp) <= MICRO_BIAS_MSS_WINDOW_MS
+        ]
+        mss_weight_used = 0.0
+        for ms in recent_mss[:3]:
+            age_f = max(0.0, 1.0 - (current_time - ms.timestamp) / MICRO_BIAS_MSS_WINDOW_MS)
+            add_w = min(0.20 * age_f, MICRO_BIAS_MSS_MAX_WEIGHT - mss_weight_used)
+            if add_w <= 0:
+                break
+            if ms.direction == "bullish":
+                bull += add_w
+            elif ms.direction == "bearish":
+                bear += add_w
+            mss_weight_used += add_w
+        if mss_weight_used > 0:
+            components["mss"] = mss_weight_used if bull >= bear else -mss_weight_used
+
+        # 3) CVD alignment confirmation
+        if self.volume_analyzer and len(self.volume_analyzer.cvd_history) >= 10:
+            cvd_sig = self.volume_analyzer.get_cvd_signal(lookback=80)
+            signal = cvd_sig.get("signal", "NEUTRAL")
+            if "BULL" in signal:
+                w = MICRO_BIAS_CVD_WEIGHT if signal == "BULL" else MICRO_BIAS_CVD_WEIGHT * 1.2
+                bull += w
+                components["cvd"] = w
+            elif "BEAR" in signal:
+                w = MICRO_BIAS_CVD_WEIGHT if signal == "BEAR" else MICRO_BIAS_CVD_WEIGHT * 1.2
+                bear += w
+                components["cvd"] = -w
+
+        edge = abs(bull - bear)
+        strength = min(max(max(bull, bear), 0.0), 1.0)
+
+        if edge < MICRO_BIAS_MIN_EDGE:
+            # Tie-breaker uses freshest small-timeframe structure only.
+            freshest = next(
+                (ms for ms in reversed(list(self.market_structures))
+                 if ms.timeframe in ("5m", "15m")
+                 and ms.structure_type in ("BOS", "CHoCH")),
+                None,
+            )
+            if freshest is None:
+                return "NEUTRAL", strength, components
+            return ("BULLISH" if freshest.direction == "bullish" else "BEARISH",
+                    strength,
+                    components)
+
+        return ("BULLISH", strength, components) if bull > bear else ("BEARISH", strength, components)
 
     # =========================================================================
     # NESTED DEALING RANGES  (3-tier IPDA)
@@ -2360,21 +2442,26 @@ class AdvancedICTStrategy:
             ctx      = TriggerContext()
             now_ms   = current_time
 
-            # ── Hard HTF bias filter ──────────────────────────────────────
-            if self.htf_bias == "BULLISH" and side == "short":
-                return 0.0, ["HTF BULLISH — shorts blocked"], ctx
-            if self.htf_bias == "BEARISH" and side == "long":
-                return 0.0, ["HTF BEARISH — longs blocked"], ctx
-            if self.htf_bias == "NEUTRAL":
-                return 0.0, ["HTF NEUTRAL"], ctx
+            # ── Directional bias filter (HTF primary, STF if HTF neutral) ──
+            exec_bias, exec_strength, _ = self._resolve_directional_bias(current_time)
+            neutral_htf_mode = (self.htf_bias == "NEUTRAL")
 
-            # ── 1. HTF Bias (0-30) ────────────────────────────────────────
-            if (side == "long"  and self.htf_bias == "BULLISH") or \
-               (side == "short" and self.htf_bias == "BEARISH"):
-                bias_score = self.htf_bias_strength * config.SCORE_HTF_BIAS
-                score     += bias_score
+            if exec_bias == "NEUTRAL":
+                return 0.0, ["No directional bias"], ctx
+            if exec_bias == "BULLISH" and side == "short":
+                return 0.0, ["Directional bias BULLISH — shorts blocked"], ctx
+            if exec_bias == "BEARISH" and side == "long":
+                return 0.0, ["Directional bias BEARISH — longs blocked"], ctx
+
+            # ── 1. Bias score (HTF or neutral/STF execution mode) ───────────
+            if (side == "long" and exec_bias == "BULLISH") or \
+               (side == "short" and exec_bias == "BEARISH"):
+                bias_weight = config.SCORE_HTF_BIAS * (0.65 if neutral_htf_mode else 1.0)
+                bias_score = exec_strength * bias_weight
+                score += bias_score
                 if bias_score > 0:
-                    reasons.append(f"HTF {self.htf_bias} +{bias_score:.1f}")
+                    src = "STF" if neutral_htf_mode else "HTF"
+                    reasons.append(f"{src} {exec_bias} +{bias_score:.1f}")
 
             # ── 2. Sweep / Liquidity (0-25) ───────────────────────────────
             sweep_age_max  = getattr(config, "SWEEP_MAX_AGE_MINUTES", 120) * 60_000
@@ -2701,12 +2788,13 @@ class AdvancedICTStrategy:
           3. No active failed setup on this side
         """
 
-        if self.htf_bias == "NEUTRAL":
-            return False, "HTF NEUTRAL"
-        if side == "long"  and self.htf_bias == "BEARISH":
-            return False, "HTF BEARISH blocks long"
-        if side == "short" and self.htf_bias == "BULLISH":
-            return False, "HTF BULLISH blocks short"
+        exec_bias, _, _ = self._resolve_directional_bias(current_time)
+        if exec_bias == "NEUTRAL":
+            return False, "No directional bias"
+        if side == "long" and exec_bias == "BEARISH":
+            return False, "Directional BEARISH blocks long"
+        if side == "short" and exec_bias == "BULLISH":
+            return False, "Directional BULLISH blocks short"
 
         # Daily DR hard-oppose (v9 fix — premium/discount gate at L1)
         if self._ndr.daily is not None:
@@ -2907,6 +2995,11 @@ class AdvancedICTStrategy:
             threshold  = (base_threshold * rs.entry_threshold_modifier
                           + self._get_adaptive_threshold_add())
 
+            # Neutral HTF mode is tradable, but requires tighter execution.
+            neutral_trade_mode = (self.htf_bias == "NEUTRAL")
+            if neutral_trade_mode:
+                threshold += 5.0
+
             # ── Near-miss reporting ───────────────────────────────────────
             if (long_score >= 75 or short_score >= 75) and \
                     (current_time - self.last_potential_trade_report) >= 600_000:
@@ -2983,135 +3076,177 @@ class AdvancedICTStrategy:
     # COHERENT LEVEL CALCULATION (unchanged from v8, DR-aware TP)
     # =========================================================================
 
+    def _find_neutral_tp(self, side: str, entry_price: float, current_time: int) -> Optional[float]:
+        """Nearest opposing OB / liquidity target for neutral HTF execution mode."""
+        candidates: List[float] = []
+
+        if side == "long":
+            candidates.extend([
+                lp.price for lp in self.liquidity_pools
+                if lp.pool_type == "EQH" and not lp.swept and lp.price > entry_price
+            ])
+            candidates.extend([
+                ob.low for ob in self.order_blocks_bear
+                if ob.is_active(current_time) and ob.low > entry_price
+            ])
+            candidates.extend([
+                sw.price for sw in list(self.swing_highs)[-12:]
+                if sw.price > entry_price
+            ])
+            return min(candidates) if candidates else None
+
+        candidates.extend([
+            lp.price for lp in self.liquidity_pools
+            if lp.pool_type == "EQL" and not lp.swept and lp.price < entry_price
+        ])
+        candidates.extend([
+            ob.high for ob in self.order_blocks_bull
+            if ob.is_active(current_time) and ob.high < entry_price
+        ])
+        candidates.extend([
+            sw.price for sw in list(self.swing_lows)[-12:]
+            if sw.price < entry_price
+        ])
+        return max(candidates) if candidates else None
+
     def _calculate_coherent_levels(
             self, side: str, current_price: float,
-            ctx: TriggerContext,
-    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+            ctx: TriggerContext, current_time: int,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
         buffer       = config.SL_BUFFER_TICKS * config.TICK_SIZE
         entry_offset = config.LIMIT_ORDER_OFFSET_TICKS * config.TICK_SIZE
         tick         = config.TICK_SIZE
 
         try:
+            neutral_htf_mode = (self.htf_bias == "NEUTRAL")
+
             if side == "long":
                 entry_price = current_price - entry_offset
-                sl_price    = None
+                sl_candidates: List[float] = []
 
                 if ctx.trigger_ob is not None:
                     cand = ctx.trigger_ob.low - buffer
                     if cand < entry_price:
-                        sl_price = cand
-                if sl_price is None and ctx.nearest_swing_low is not None:
+                        sl_candidates.append(cand)
+                if ctx.nearest_swing_low is not None:
                     cand = ctx.nearest_swing_low - buffer
                     if cand < entry_price:
-                        sl_price = cand
-                if sl_price is None and ctx.trigger_fvg is not None:
+                        sl_candidates.append(cand)
+                if ctx.trigger_fvg is not None:
                     cand = ctx.trigger_fvg.bottom - buffer
                     if cand < entry_price:
-                        sl_price = cand
-                if sl_price is None:
-                    sl_price = entry_price * (1 - 0.005)
+                        sl_candidates.append(cand)
+                if not sl_candidates:
+                    return None, None, None, None, None
+                sl_price = max(sl_candidates)
 
                 sl_dist = (entry_price - sl_price) / entry_price
+                max_sl_pct = min(config.MAX_SL_DISTANCE_PCT, NEUTRAL_SL_MAX_PCT) if neutral_htf_mode else config.MAX_SL_DISTANCE_PCT
                 if sl_dist < config.MIN_SL_DISTANCE_PCT:
                     sl_price = entry_price * (1 - config.MIN_SL_DISTANCE_PCT)
-                elif sl_dist > config.MAX_SL_DISTANCE_PCT:
-                    sl_price = entry_price * (1 - config.MAX_SL_DISTANCE_PCT)
+                elif sl_dist > max_sl_pct:
+                    sl_price = entry_price * (1 - max_sl_pct)
 
                 risk    = entry_price - sl_price
                 tp1     = None
                 tp2     = None
                 tp_final = None
 
-                # TP1: nearest swing high or DR midpoint
-                if ctx.nearest_swing_high is not None:
-                    rr = (ctx.nearest_swing_high - entry_price) / risk \
-                         if risk > 0 else 0
-                    if rr >= config.MIN_RISK_REWARD_RATIO:
-                        tp1 = ctx.nearest_swing_high
-
-                # TP2: intraday DR extreme or 2× TP1 distance
-                dr = self._ndr.intraday or self._ndr.daily
-                if dr is not None:
-                    tp2_cand = dr.high
-                    if tp2_cand > entry_price:
-                        tp2 = tp2_cand
-                if tp2 is None and tp1 is not None:
-                    tp2 = entry_price + (tp1 - entry_price) * 2.0
-
-                # TP_final (tp3 trail anchor = TP2 or target RR)
-                if tp2 is not None and tp2 > entry_price:
-                    tp_final = tp2
+                if neutral_htf_mode:
+                    tp_near = self._find_neutral_tp(side, entry_price, current_time)
+                    if tp_near is None or tp_near <= entry_price:
+                        return None, None, None, None, None
+                    tp1 = tp2 = tp_final = tp_near
                 else:
-                    tp_final = entry_price + risk * config.TARGET_RISK_REWARD_RATIO
+                    if ctx.nearest_swing_high is not None:
+                        rr = (ctx.nearest_swing_high - entry_price) / risk if risk > 0 else 0
+                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                            tp1 = ctx.nearest_swing_high
 
-                # Clamp TP_final RR
-                if tp_final is not None:
-                    rr_final = (tp_final - entry_price) / risk if risk > 0 else 0
-                    if rr_final > getattr(config, "MAX_RR_RATIO", 10):
-                        tp_final = (entry_price +
-                                    risk * getattr(config, "MAX_RR_RATIO", 10))
+                    dr = self._ndr.intraday or self._ndr.daily
+                    if dr is not None:
+                        tp2_cand = dr.high
+                        if tp2_cand > entry_price:
+                            tp2 = tp2_cand
+                    if tp2 is None and tp1 is not None:
+                        tp2 = entry_price + (tp1 - entry_price) * 2.0
+
+                    if tp2 is not None and tp2 > entry_price:
+                        tp_final = tp2
+                    else:
+                        tp_final = entry_price + risk * config.TARGET_RISK_REWARD_RATIO
+
+                    if tp_final is not None:
+                        rr_final = (tp_final - entry_price) / risk if risk > 0 else 0
+                        if rr_final > getattr(config, "MAX_RR_RATIO", 10):
+                            tp_final = (entry_price + risk * getattr(config, "MAX_RR_RATIO", 10))
 
             else:  # short
                 entry_price = current_price + entry_offset
-                sl_price    = None
+                sl_candidates: List[float] = []
 
                 if ctx.trigger_ob is not None:
                     cand = ctx.trigger_ob.high + buffer
                     if cand > entry_price:
-                        sl_price = cand
-                if sl_price is None and ctx.nearest_swing_high is not None:
+                        sl_candidates.append(cand)
+                if ctx.nearest_swing_high is not None:
                     cand = ctx.nearest_swing_high + buffer
                     if cand > entry_price:
-                        sl_price = cand
-                if sl_price is None and ctx.trigger_fvg is not None:
+                        sl_candidates.append(cand)
+                if ctx.trigger_fvg is not None:
                     cand = ctx.trigger_fvg.top + buffer
                     if cand > entry_price:
-                        sl_price = cand
-                if sl_price is None:
-                    sl_price = entry_price * (1 + 0.005)
+                        sl_candidates.append(cand)
+                if not sl_candidates:
+                    return None, None, None, None, None
+                sl_price = min(sl_candidates)
 
                 sl_dist = (sl_price - entry_price) / entry_price
+                max_sl_pct = min(config.MAX_SL_DISTANCE_PCT, NEUTRAL_SL_MAX_PCT) if neutral_htf_mode else config.MAX_SL_DISTANCE_PCT
                 if sl_dist < config.MIN_SL_DISTANCE_PCT:
                     sl_price = entry_price * (1 + config.MIN_SL_DISTANCE_PCT)
-                elif sl_dist > config.MAX_SL_DISTANCE_PCT:
-                    sl_price = entry_price * (1 + config.MAX_SL_DISTANCE_PCT)
+                elif sl_dist > max_sl_pct:
+                    sl_price = entry_price * (1 + max_sl_pct)
 
                 risk    = sl_price - entry_price
                 tp1     = None
                 tp2     = None
                 tp_final = None
 
-                if ctx.nearest_swing_low is not None:
-                    rr = (entry_price - ctx.nearest_swing_low) / risk \
-                         if risk > 0 else 0
-                    if rr >= config.MIN_RISK_REWARD_RATIO:
-                        tp1 = ctx.nearest_swing_low
+                if neutral_htf_mode:
+                    tp_near = self._find_neutral_tp(side, entry_price, current_time)
+                    if tp_near is None or tp_near >= entry_price:
+                        return None, None, None, None, None
+                    tp1 = tp2 = tp_final = tp_near
+                else:
+                    if ctx.nearest_swing_low is not None:
+                        rr = (entry_price - ctx.nearest_swing_low) / risk if risk > 0 else 0
+                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                            tp1 = ctx.nearest_swing_low
 
-                dr = self._ndr.intraday or self._ndr.daily
-                if dr is not None:
-                    tp2_cand = dr.low
-                    if tp2_cand < entry_price:
-                        tp2 = tp2_cand
-                if tp2 is None and tp1 is not None:
-                    tp2 = entry_price - (entry_price - tp1) * 2.0
+                    dr = self._ndr.intraday or self._ndr.daily
+                    if dr is not None:
+                        tp2_cand = dr.low
+                        if tp2_cand < entry_price:
+                            tp2 = tp2_cand
+                    if tp2 is None and tp1 is not None:
+                        tp2 = entry_price - (entry_price - tp1) * 2.0
 
-                tp_final = (tp2 if tp2 is not None and tp2 < entry_price
-                            else entry_price - risk * config.TARGET_RISK_REWARD_RATIO)
+                    tp_final = (tp2 if tp2 is not None and tp2 < entry_price
+                                else entry_price - risk * config.TARGET_RISK_REWARD_RATIO)
 
-                if tp_final is not None:
-                    rr_final = (entry_price - tp_final) / risk if risk > 0 else 0
-                    if rr_final > getattr(config, "MAX_RR_RATIO", 10):
-                        tp_final = (entry_price -
-                                    risk * getattr(config, "MAX_RR_RATIO", 10))
+                    if tp_final is not None:
+                        rr_final = (entry_price - tp_final) / risk if risk > 0 else 0
+                        if rr_final > getattr(config, "MAX_RR_RATIO", 10):
+                            tp_final = (entry_price - risk * getattr(config, "MAX_RR_RATIO", 10))
 
-            # Round to tick
             entry_price = round(entry_price / tick) * tick
             sl_price    = round(sl_price    / tick) * tick
             tp_final    = round(tp_final    / tick) * tick if tp_final else None
             tp1         = round(tp1         / tick) * tick if tp1      else None
             tp2         = round(tp2         / tick) * tick if tp2      else None
 
-            return entry_price, sl_price, tp_final, tp1, tp2  # type: ignore
+            return entry_price, sl_price, tp_final, tp1, tp2
 
         except Exception as e:
             logger.error(f"❌ Coherent levels error: {e}", exc_info=True)
@@ -3162,7 +3297,7 @@ class AdvancedICTStrategy:
                 logger.info(f"   {r}")
             logger.info("=" * 80)
 
-            levels = self._calculate_coherent_levels(side, current_price, ctx)
+            levels = self._calculate_coherent_levels(side, current_price, ctx, current_time)
             entry_price, sl_price, tp_price, tp1, tp2 = levels
 
             if entry_price is None:
@@ -3202,8 +3337,9 @@ class AdvancedICTStrategy:
                 logger.warning("⚠️ Invalid position size")
                 return
 
+            neutral_size_mult = 0.60 if self.htf_bias == "NEUTRAL" else 1.0
             position_size = round(
-                position_size * rs.size_multiplier * dr_m * adapt_m, 8)
+                position_size * rs.size_multiplier * dr_m * adapt_m * neutral_size_mult, 8)
             if position_size <= 0:
                 logger.warning("⚠️ Position size zeroed by multipliers")
                 return
