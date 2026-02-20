@@ -875,12 +875,12 @@ class AdvancedICTStrategy:
 
             # ── OB visit count update ─────────────────────────────────────────
             for ob in list(self.order_blocks_bull) + list(self.order_blocks_bear):
-                if (not ob.broken and
-                        ob.is_active(current_time) and
-                        ob.contains_price(current_price)):
-                    # Increment only once per OB until price leaves the zone
-                    # (handled by tracking ob.visit_count in detection above)
-                    pass
+                if not ob.broken and ob.is_active(current_time):
+                    was_in_zone = getattr(ob, '_price_was_in_zone', False)
+                    now_in_zone = ob.contains_price(current_price)
+                    if now_in_zone and not was_in_zone:
+                        ob.visit_count += 1
+                    ob._price_was_in_zone = now_in_zone
 
             # ── Market structure ──────────────────────────────────────────────
             prev_bias = self.htf_bias
@@ -971,9 +971,8 @@ class AdvancedICTStrategy:
 
             # 2. EMA slope (20%)
             if len(closes) >= ema_period + 4:
-                ema_now  = self._calculate_ema(closes,      ema_period)
                 ema_prev = self._calculate_ema(closes[:-4], ema_period)
-                if ema_now > ema_prev:
+                if ema_val > ema_prev:
                     bull += 0.20; comp["ema_slope"] = "BULL"
                 else:
                     bear += 0.20; comp["ema_slope"] = "BEAR"
@@ -1037,9 +1036,9 @@ class AdvancedICTStrategy:
     def _update_daily_bias(self, candles_5m: List[Dict],
                             current_price: float) -> None:
         try:
-            if len(candles_5m) < 20:
+            if len(candles_5m) < 80:
                 return
-            closes      = [float(c['c']) for c in candles_5m[-20:]]
+            closes      = [float(c['c']) for c in candles_5m[-80:]]
             ema_fast    = self._calculate_ema(closes, 8)
             ema_slow    = self._calculate_ema(closes, 20)
             recent_avg  = sum(closes[-4:]) / 4
@@ -2277,8 +2276,11 @@ class AdvancedICTStrategy:
                     fvg.filled = True
 
         # Purge old sweeps from dedup set to avoid unbounded growth
-        if len(self._registered_sweeps) > 5000:
-            self._registered_sweeps.clear()
+        cutoff = current_time - 48 * 3_600_000
+        self._registered_sweeps = {
+            key for key in self._registered_sweeps
+            if key[1] > cutoff
+        }
 
     # =========================================================================
     # FAILED SETUP INTELLIGENCE (unchanged from v8)
@@ -3306,6 +3308,12 @@ class AdvancedICTStrategy:
                 position_size * rs.size_multiplier * dr_m * adapt_m * neutral_size_mult, 8)
             if position_size <= 0:
                 logger.warning("⚠️ Position size zeroed by multipliers")
+                return
+
+            min_qty = getattr(config, "MIN_ORDER_QTY", 0.001)
+            if position_size < min_qty:
+                logger.warning(
+                    f"⚠️ Position size {position_size:.6f} < min_qty {min_qty} — skipped")
                 return
 
             logger.info(
